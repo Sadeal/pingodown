@@ -109,41 +109,20 @@ func (p *proxy) Run(ctx context.Context) error {
 				// Get client IP from address
 				clientIP := packet.clientAddress.IP.String()
 
-				// Wait for ping data (up to 5 seconds)
-				clientActualPing := p.minPingMS
-				waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				for i := 0; i < 50; i++ { // Try 50 times with 100ms intervals
-					if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
-						clientActualPing = actualPing
-						p.logger.Info("Got ping data for client %s after %dms: %d ms", clientIP, i*100, clientActualPing)
-						break
-					}
-					select {
-					case <-waitCtx.Done():
-						p.logger.Warn("Timeout waiting for ping data from client %s, using minimum ping %d ms", clientIP, p.minPingMS)
-						break
-					case <-time.After(100 * time.Millisecond):
-					}
-				}
-				cancel()
-
-				// Create connection
+				// Create connection immediately
 				conn, err = connection.NewConnection(p.serverAddress, packet.clientAddress, p.bufferSize)
 				if err != nil {
 					p.logger.Error("Failed to create connection: %v", err)
 					continue
 				}
 
-				// Set ping with dynamic calculation
-				conn.SetPing(p.minPingMS, clientActualPing)
-				p.logger.Info("Set ping for client %s: min=%d ms, actual=%d ms, additional=%d ms", 
-					clientIP, p.minPingMS, clientActualPing, p.minPingMS-clientActualPing)
-
+				// Start goroutine to monitor ping updates and apply delays
 				conn = p.state.SetConnection(conn)
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
+				go p.monitorAndApplyPing(ctx, clientIP, conn)
 			}
 
-			// Forward packet to server with delay (capture conn in closure properly)
+			// Forward packet to server with delay
 			func(c connection.Connection, data []byte) {
 				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
 					p.logger.Error("Error writing to server: %v", err)
@@ -154,6 +133,36 @@ func (p *proxy) Run(ctx context.Context) error {
 			p.logger.Info("Context canceled, closing proxy connection")
 			p.pingReceiver.Close()
 			return p.proxyConn.Close()
+		}
+	}
+}
+
+// monitorAndApplyPing waits for ping data and applies delay when it arrives
+func (p *proxy) monitorAndApplyPing(ctx context.Context, clientIP string, conn connection.Connection) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	pingApplied := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if pingApplied {
+				continue
+			}
+
+			// Try to get ping data
+			actualPing, err := p.state.GetClientPing(clientIP)
+			if err == nil {
+				// Got ping data - apply it
+				conn.SetPing(p.minPingMS, actualPing)
+				p.logger.Info("Applied ping for client %s: min=%d ms, actual=%d ms, additional=%d ms",
+					clientIP, p.minPingMS, actualPing, p.minPingMS-actualPing)
+				pingApplied = true
+				return
+			}
 		}
 	}
 }
