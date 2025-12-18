@@ -105,24 +105,39 @@ func (p *proxy) Run(ctx context.Context) error {
 			conn, err := p.state.GetConnection(packet.clientAddress)
 			if err != nil {
 				p.logger.Info("New client %s connecting", packet.clientAddress)
+				
+				// Get client IP from address
+				clientIP := packet.clientAddress.IP.String()
+
+				// Wait for ping data (up to 5 seconds)
+				clientActualPing := p.minPingMS
+				waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				for i := 0; i < 50; i++ { // Try 50 times with 100ms intervals
+					if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
+						clientActualPing = actualPing
+						p.logger.Info("Got ping data for client %s after %dms: %d ms", clientIP, i*100, clientActualPing)
+						break
+					}
+					select {
+					case <-waitCtx.Done():
+						p.logger.Warn("Timeout waiting for ping data from client %s, using minimum ping %d ms", clientIP, p.minPingMS)
+						break
+					case <-time.After(100 * time.Millisecond):
+					}
+				}
+				cancel()
+
+				// Create connection
 				conn, err = connection.NewConnection(p.serverAddress, packet.clientAddress, p.bufferSize)
 				if err != nil {
 					p.logger.Error("Failed to create connection: %v", err)
 					continue
 				}
 
-				// Get client IP from address
-				clientIP := packet.clientAddress.IP.String()
-
-				// Get actual client ping from state, or use minPingMS as default
-				clientActualPing := p.minPingMS
-				if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
-					clientActualPing = actualPing
-				}
-
 				// Set ping with dynamic calculation
 				conn.SetPing(p.minPingMS, clientActualPing)
-				p.logger.Info("Set ping for client %s: min=%d ms, actual=%d ms", clientIP, p.minPingMS, clientActualPing)
+				p.logger.Info("Set ping for client %s: min=%d ms, actual=%d ms, additional=%d ms", 
+					clientIP, p.minPingMS, clientActualPing, p.minPingMS-clientActualPing)
 
 				conn = p.state.SetConnection(conn)
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
