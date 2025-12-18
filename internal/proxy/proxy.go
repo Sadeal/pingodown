@@ -84,7 +84,8 @@ func (p *proxy) Run(ctx context.Context) error {
 		}
 	}()
 
-	// Goroutine to handle ping data updates
+	// Goroutine to handle ping data updates - track which clients need ping application
+	clientConnMap := make(map[string]connection.Connection)
 	go func() {
 		for {
 			select {
@@ -92,7 +93,22 @@ func (p *proxy) Run(ctx context.Context) error {
 				if err := p.state.UpdateClientPing(pingData.ClientIP, pingData.PingMS); err != nil {
 					p.logger.Error("Failed to update client ping: %v", err)
 				}
-				p.logger.Info("Updated ping for client %s: %d ms", pingData.ClientIP, pingData.PingMS)
+				p.logger.Info("Received ping %d ms from %s", pingData.PingMS, pingData.ClientIP)
+				
+				// If we have a connection for this client, apply the ping immediately
+				if conn, exists := clientConnMap[pingData.ClientIP]; exists {
+					additionalPing := p.minPingMS - pingData.PingMS
+					if additionalPing < 0 {
+						additionalPing = 0
+					}
+					
+					if additionalPing > 0 {
+						conn.SetPing(p.minPingMS, pingData.PingMS)
+						p.logger.Info("Saw ping %d, ping is below %d ms, adding %d ms delay", pingData.PingMS, p.minPingMS, additionalPing)
+					} else {
+						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", pingData.PingMS, p.minPingMS)
+					}
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -119,12 +135,25 @@ func (p *proxy) Run(ctx context.Context) error {
 
 				// Save connection
 				conn = p.state.SetConnection(conn)
+				clientConnMap[clientIP] = conn
+				
+				// Check if we already have ping data for this client
+				if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
+					additionalPing := p.minPingMS - actualPing
+					if additionalPing < 0 {
+						additionalPing = 0
+					}
+					
+					if additionalPing > 0 {
+						conn.SetPing(p.minPingMS, actualPing)
+						p.logger.Info("Saw ping %d, ping is below %d ms, adding %d ms delay", actualPing, p.minPingMS, additionalPing)
+					} else {
+						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", actualPing, p.minPingMS)
+					}
+				}
 				
 				// Start server-to-client forwarding
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
-				
-				// Start goroutine to monitor and apply ping delays continuously
-				go p.monitorAndApplyPing(ctx, clientIP, conn)
 			}
 
 			// Forward packet to server with delay
@@ -138,39 +167,6 @@ func (p *proxy) Run(ctx context.Context) error {
 			p.logger.Info("Context canceled, closing proxy connection")
 			p.pingReceiver.Close()
 			return p.proxyConn.Close()
-		}
-	}
-}
-
-// monitorAndApplyPing continuously monitors ping data and applies/updates delay
-func (p *proxy) monitorAndApplyPing(ctx context.Context, clientIP string, conn connection.Connection) {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-
-	lastAppliedPing := int64(-1) // Track last ping to avoid re-applying same value
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// Try to get current ping data
-			actualPing, err := p.state.GetClientPing(clientIP)
-			if err == nil {
-				// Got ping data
-				if actualPing != lastAppliedPing {
-					// Ping changed or first time - apply it
-					conn.SetPing(p.minPingMS, actualPing)
-					additionalPing := p.minPingMS - actualPing
-					if additionalPing < 0 {
-						additionalPing = 0
-					}
-					p.logger.Info("Applied ping for client %s: min=%d ms, actual=%d ms, additional=%d ms",
-						clientIP, p.minPingMS, actualPing, additionalPing)
-					lastAppliedPing = actualPing
-				}
-			}
-			// If no ping data yet, continue waiting
 		}
 	}
 }
