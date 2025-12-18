@@ -67,20 +67,20 @@ func main() {
 	// Build addresses
 	listenAddress := fmt.Sprintf(":%d", listenPort)
 	pingAddress := fmt.Sprintf(":%d", pingPort)
-	serverAddress := fmt.Sprintf("127.0.0.1:%d", serverPort)
+	serverAddress := fmt.Sprintf("%s:%d", serverIP, serverPort)
 	minPing := time.Duration(pingMS) * time.Millisecond
 
 	logger.Info("Starting pingodown")
 	logger.Info("  Server port: %d", serverPort)
 	logger.Info("  Listen port: %d (clients connect here)", listenPort)
 	logger.Info("  Ping port: %d (ping data here)", pingPort)
-	logger.Info("  Server IP: %s", serverIP)
+	logger.Info("  Server address: %s", serverAddress)
 	logger.Info("  Minimum ping: %d ms", pingMS)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p, err := proxy.NewProxy(listenAddress, pingAddress, serverAddress, serverIP, logger, minPing)
+	p, err := proxy.NewProxy(listenAddress, pingAddress, serverAddress, logger, minPing)
 	if err != nil {
 		logger.Error("Failed to create proxy: %v", err)
 		os.Exit(1)
