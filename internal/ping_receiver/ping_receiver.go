@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/qdm12/golibs/logging"
 )
@@ -22,10 +23,12 @@ type PingReceiver interface {
 }
 
 type pingReceiver struct {
-	conn     *net.UDPConn
-	dataChan chan PingData
-	logger   logging.Logger
-	bufSize  int
+	conn      *net.UDPConn
+	dataChan  chan PingData
+	logger    logging.Logger
+	bufSize   int
+	closeOnce sync.Once
+	closed    bool
 }
 
 func NewPingReceiver(listenAddress string, logger logging.Logger) (PingReceiver, error) {
@@ -88,8 +91,13 @@ func (pr *pingReceiver) Start(ctx context.Context) error {
 }
 
 func (pr *pingReceiver) Close() error {
-	close(pr.dataChan)
-	return pr.conn.Close()
+	var err error
+	pr.closeOnce.Do(func() {
+		pr.closed = true
+		close(pr.dataChan)
+		err = pr.conn.Close()
+	})
+	return err
 }
 
 func ParsePingData(data string) (PingData, error) {

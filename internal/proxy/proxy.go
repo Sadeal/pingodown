@@ -128,12 +128,12 @@ func (p *proxy) Run(ctx context.Context) error {
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
 			}
 
-			// Forward packet to server with delay
-			go func() {
-				if err := conn.WriteToServerWithDelay(ctx, packet.data); err != nil {
+			// Forward packet to server with delay (capture conn in closure properly)
+			func(c connection.Connection, data []byte) {
+				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
 					p.logger.Error("Error writing to server: %v", err)
 				}
-			}()
+			}(conn, packet.data)
 
 		case <-ctx.Done():
 			p.logger.Info("Context canceled, closing proxy connection")
@@ -148,7 +148,7 @@ func readFromClients(proxy *net.UDPConn, packets chan<- clientPacket, bufferSize
 	for {
 		bytesRead, clientAddress, err := proxy.ReadFromUDP(buffer)
 		if err != nil {
-			return err
+			return fmt.Errorf("error reading from UDP: %w", err)
 		}
 
 		data := make([]byte, bytesRead)

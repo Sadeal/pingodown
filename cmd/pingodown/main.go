@@ -71,11 +71,11 @@ func main() {
 	minPing := time.Duration(pingMS) * time.Millisecond
 
 	logger.Info("Starting pingodown")
-	logger.Info("  Server port: %d", serverPort)
-	logger.Info("  Listen port: %d (clients connect here)", listenPort)
-	logger.Info("  Ping port: %d (ping data here)", pingPort)
-	logger.Info("  Server address: %s", serverAddress)
-	logger.Info("  Minimum ping: %d ms", pingMS)
+	logger.Info("Server port: %d", serverPort)
+	logger.Info("Listen port: %d (clients connect here)", listenPort)
+	logger.Info("Ping port: %d (ping data here)", pingPort)
+	logger.Info("Server address: %s", serverAddress)
+	logger.Info("Minimum ping: %d ms", pingMS)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
