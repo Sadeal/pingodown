@@ -156,7 +156,6 @@ func (p *proxy) Run(ctx context.Context) error {
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
 			}
 
-			// Forward packet to server with delay
 			go func(c connection.Connection, data []byte) {
 				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
 					p.logger.Error("Error writing to server: %v", err)
