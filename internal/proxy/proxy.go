@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/qdm12/golibs/logging"
@@ -24,15 +25,19 @@ type proxy struct {
 	logger          logging.Logger
 	minPingMS       int64
 	pingReceiver    ping_receiver.PingReceiver
+	connections     map[string]connection.Connection
+	connMutex       sync.Mutex
+	wg              sync.WaitGroup
 }
 
 func NewProxy(listenAddress, pingAddress, serverAddress string, logger logging.Logger, minPing time.Duration) (Proxy, error) {
 	s := state.NewState()
 	p := &proxy{
-		bufferSize: 65535,
-		state:      s,
-		logger:     logger,
-		minPingMS:  minPing.Milliseconds(),
+		bufferSize:  65535,
+		state:       s,
+		logger:      logger,
+		minPingMS:   minPing.Milliseconds(),
+		connections: make(map[string]connection.Connection),
 	}
 
 	// Create main proxy connection (for clients)
@@ -78,15 +83,18 @@ func (p *proxy) Run(ctx context.Context) error {
 	}
 
 	// Goroutine to read game packets from clients
+	p.wg.Add(1)
 	go func() {
+		defer p.wg.Done()
 		if err := readFromClients(p.proxyConn, packets, p.bufferSize); err != nil {
 			p.logger.Error("Error reading from clients: %v", err)
 		}
 	}()
 
-	// Goroutine to handle ping data updates - track which clients need ping application
-	clientConnMap := make(map[string]connection.Connection)
+	// Goroutine to handle ping data updates
+	p.wg.Add(1)
 	go func() {
+		defer p.wg.Done()
 		for {
 			select {
 			case pingData := <-p.pingReceiver.GetDataChan():
@@ -96,7 +104,8 @@ func (p *proxy) Run(ctx context.Context) error {
 				p.logger.Info("Received ping %d ms from %s", pingData.PingMS, pingData.ClientIP)
 				
 				// If we have a connection for this client, apply the ping immediately
-				if conn, exists := clientConnMap[pingData.ClientIP]; exists {
+				p.connMutex.Lock()
+				if conn, exists := p.connections[pingData.ClientIP]; exists {
 					additionalPing := p.minPingMS - pingData.PingMS
 					if additionalPing < 0 {
 						additionalPing = 0
@@ -109,6 +118,7 @@ func (p *proxy) Run(ctx context.Context) error {
 						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", pingData.PingMS, p.minPingMS)
 					}
 				}
+				p.connMutex.Unlock()
 			case <-ctx.Done():
 				return
 			}
@@ -135,7 +145,9 @@ func (p *proxy) Run(ctx context.Context) error {
 
 				// Save connection
 				conn = p.state.SetConnection(conn)
-				clientConnMap[clientIP] = conn
+				p.connMutex.Lock()
+				p.connections[clientIP] = conn
+				p.connMutex.Unlock()
 				
 				// Check if we already have ping data for this client
 				if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
@@ -153,7 +165,11 @@ func (p *proxy) Run(ctx context.Context) error {
 				}
 				
 				// Start server-to-client forwarding
-				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
+				p.wg.Add(1)
+				go func(c connection.Connection) {
+					defer p.wg.Done()
+					c.ForwardServerToClient(ctx, p.proxyConn, p.logger)
+				}(conn)
 			}
 
 			// Forward packet to server with delay
@@ -164,11 +180,28 @@ func (p *proxy) Run(ctx context.Context) error {
 			}(conn, packet.data)
 
 		case <-ctx.Done():
-			p.logger.Info("Context canceled, closing proxy connection")
+			p.logger.Info("Context canceled, closing connections and proxy")
+			p.closeAllConnections()
 			p.pingReceiver.Close()
-			return p.proxyConn.Close()
+			p.proxyConn.Close()
+			p.wg.Wait()
+			return nil
 		}
 	}
+}
+
+// closeAllConnections closes all active client connections
+func (p *proxy) closeAllConnections() {
+	p.connMutex.Lock()
+	defer p.connMutex.Unlock()
+
+	for clientIP, conn := range p.connections {
+		p.logger.Info("Closing connection for client %s", clientIP)
+		if err := conn.Close(); err != nil {
+			p.logger.Error("Error closing connection for %s: %v", clientIP, err)
+		}
+	}
+	p.connections = make(map[string]connection.Connection)
 }
 
 func readFromClients(proxy *net.UDPConn, packets chan<- clientPacket, bufferSize int) error {
