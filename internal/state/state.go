@@ -59,7 +59,8 @@ func (s *state) SetConnection(conn connection.Connection) connection.Connection 
 	s.connectionsMutex.Lock()
 	defer s.connectionsMutex.Unlock()
 
-	key := conn.GetClientUDPAddress().String()
+	addr := conn.GetClientUDPAddress()
+	key := (&addr).String()
 	if existing, ok := s.connections[key]; ok {
 		return existing
 	}
