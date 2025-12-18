@@ -25,6 +25,7 @@ type connection struct {
 	bufferSize     int
 	inboundDelay   time.Duration
 	outboundDelay  time.Duration
+	logger         logging.Logger
 	sync.RWMutex
 }
 
@@ -39,6 +40,21 @@ func NewConnection(serverAddress, clientAddress *net.UDPAddr, bufferSize int) (C
 		clientAddress: *clientAddress,
 		server:        server,
 		bufferSize:    bufferSize,
+	}, nil
+}
+
+// NewConnectionWithLogger creates a connection with logger for debugging
+func NewConnectionWithLogger(serverAddress, clientAddress *net.UDPAddr, bufferSize int, logger logging.Logger) (Connection, error) {
+	server, err := net.DialUDP("udp", nil, serverAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	return &connection{
+		clientAddress: *clientAddress,
+		server:        server,
+		bufferSize:    bufferSize,
+		logger:        logger,
 	}, nil
 }
 
@@ -76,6 +92,11 @@ func (c *connection) SetPing(minimumPingMS int64, clientActualPingMS int64) {
 	additionalPing := time.Duration(additionalPingMS) * time.Millisecond
 	c.inboundDelay = additionalPing / 2
 	c.outboundDelay = additionalPing / 2
+
+	if c.logger != nil {
+		c.logger.Info("SetPing called for client %s: minimum=%d ms, actual=%d ms, additional delay=%d ms, inbound=%d ms, outbound=%d ms",
+			c.clientAddress, minimumPingMS, clientActualPingMS, additionalPingMS, c.inboundDelay.Milliseconds(), c.outboundDelay.Milliseconds())
+	}
 }
 
 func (c *connection) GetClientUDPAddress() net.UDPAddr {

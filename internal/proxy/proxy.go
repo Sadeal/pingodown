@@ -149,7 +149,7 @@ func (p *proxy) Run(ctx context.Context) error {
 				p.connections[clientIP] = conn
 				p.connMutex.Unlock()
 				
-				// Check if we already have ping data for this client
+				// Check if we already have ping data for this client and apply it IMMEDIATELY
 				if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
 					additionalPing := p.minPingMS - actualPing
 					if additionalPing < 0 {
@@ -162,6 +162,8 @@ func (p *proxy) Run(ctx context.Context) error {
 					} else {
 						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", actualPing, p.minPingMS)
 					}
+				} else {
+					p.logger.Info("No ping data yet for client %s, will apply when ping arrives", clientIP)
 				}
 				
 				// Start server-to-client forwarding
