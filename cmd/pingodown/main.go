@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/qdm12/golibs/logging"
-	"github.com/qdm12/pingodown/internal/proxy"
+	"github.com/qdm12/pingodown/internal/firewall"
 	"github.com/qdm12/pingodown/internal/net_utils"
+	"github.com/qdm12/pingodown/internal/proxy"
 )
 
 func main() {
@@ -77,17 +80,49 @@ func main() {
 	logger.Info("Server address: %s", serverAddress)
 	logger.Info("Minimum ping: %d ms", pingMS)
 
+	// Setup firewall redirect
+	fw := firewall.NewFirewall(logger)
+	if err := fw.AddRedirect(serverPort, listenPort); err != nil {
+		logger.Error("Failed to add firewall redirect: %v", err)
+		logger.Info("Note: Firewall redirect requires root/sudo. Continuing without redirect.")
+	}
+
+	// Setup signal handler for cleanup
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	p, err := proxy.NewProxy(listenAddress, pingAddress, serverAddress, logger, minPing)
 	if err != nil {
 		logger.Error("Failed to create proxy: %v", err)
+		fw.RemoveRedirect(serverPort, listenPort)
 		os.Exit(1)
 	}
 
-	if err := p.Run(ctx); err != nil {
-		logger.Error("Proxy error: %v", err)
-		os.Exit(1)
+	// Run proxy in goroutine
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- p.Run(ctx)
+	}()
+
+	// Wait for signal or error
+	select {
+	case <-sigChan:
+		logger.Info("Received shutdown signal")
+		cancel()
+	case err := <-errChan:
+		if err != nil {
+			logger.Error("Proxy error: %v", err)
+		}
 	}
+
+	// Cleanup firewall rules
+	logger.Info("Cleaning up firewall rules...")
+	if err := fw.RemoveRedirect(serverPort, listenPort); err != nil {
+		logger.Error("Failed to remove firewall redirect: %v", err)
+	}
+
+	logger.Info("Shutdown complete")
 }
