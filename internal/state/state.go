@@ -4,32 +4,32 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/qdm12/pingodown/internal/connection"
 )
 
 type State interface {
 	GetClientAddresses() (clientAddresses []*net.UDPAddr)
-	// SetConnection sets a connection in the state and returns the saved connection or the
-	// already existing connection as it does not overwrite an existing connection
 	SetConnection(conn connection.Connection) connection.Connection
-	// GetConnection retrieves an existing connection from the state
 	GetConnection(clientAddress *net.UDPAddr) (conn connection.Connection, err error)
+	UpdateClientPing(clientIP string, pingMS int64) error
+	GetClientPing(clientIP string) (int64, error)
 }
 
 type state struct {
-	// Key is the client IP address
-	latencies map[string]time.Duration
-	// Key is the client address
-	connections      map[string]connection.Connection
+	// Key is the client address (IP:PORT)
+	connections map[string]connection.Connection
+	
+	// Key is the client IP address only
+	clientPings map[string]int64
+	
 	connectionsMutex sync.RWMutex
 }
 
 func NewState() State {
 	return &state{
 		connections: make(map[string]connection.Connection),
-		latencies:   make(map[string]time.Duration),
+		clientPings: make(map[string]int64),
 	}
 }
 
@@ -57,9 +57,33 @@ func (s *state) SetConnection(conn connection.Connection) connection.Connection 
 	s.connectionsMutex.Lock()
 	defer s.connectionsMutex.Unlock()
 	key := conn.GetClientUDPAddress().String()
-	if conn, ok := s.connections[key]; ok { // in case it still got created
-		return conn
+	if existing, ok := s.connections[key]; ok {
+		return existing
 	}
 	s.connections[key] = conn
 	return conn
+}
+
+func (s *state) UpdateClientPing(clientIP string, pingMS int64) error {
+	s.connectionsMutex.Lock()
+	defer s.connectionsMutex.Unlock()
+	
+	if pingMS < 0 {
+		return fmt.Errorf("ping cannot be negative: %d", pingMS)
+	}
+	
+	s.clientPings[clientIP] = pingMS
+	return nil
+}
+
+func (s *state) GetClientPing(clientIP string) (int64, error) {
+	s.connectionsMutex.RLock()
+	defer s.connectionsMutex.RUnlock()
+	
+	pingMS, ok := s.clientPings[clientIP]
+	if !ok {
+		return 0, fmt.Errorf("no ping data found for client IP %s", clientIP)
+	}
+	
+	return pingMS, nil
 }

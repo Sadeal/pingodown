@@ -14,7 +14,7 @@ type Connection interface {
 	GetClientUDPAddress() *net.UDPAddr
 	ForwardServerToClient(ctx context.Context, proxy *net.UDPConn, logger logging.Logger)
 	WriteToServerWithDelay(ctx context.Context, data []byte) error
-	SetPing(ping time.Duration)
+	SetPing(minimumPingMS int64, clientActualPingMS int64)
 }
 
 // Information maintained for each client/server connection
@@ -33,6 +33,7 @@ func NewConnection(serverAddress, clientAddress *net.UDPAddr, bufferSize int) (C
 	if err != nil {
 		return nil, err
 	}
+
 	return &connection{
 		clientAddress: clientAddress,
 		server:        server,
@@ -56,14 +57,20 @@ func (c *connection) getOutboundDelay() time.Duration {
 	return c.outboundDelay
 }
 
-func (c *connection) SetPing(ping time.Duration) {
+func (c *connection) SetPing(minimumPingMS int64, clientActualPingMS int64) {
 	c.Lock()
 	defer c.Unlock()
-	if ping < 0 { // cannot go faster than the connection
-		ping = 0
+
+	// Calculate additional ping needed
+	additionalPingMS := minimumPingMS - clientActualPingMS
+	if additionalPingMS < 0 {
+		additionalPingMS = 0
 	}
-	c.inboundDelay = ping / 2
-	c.outboundDelay = ping / 2
+
+	// Convert to duration and split equally
+	additionalPing := time.Duration(additionalPingMS) * time.Millisecond
+	c.inboundDelay = additionalPing / 2
+	c.outboundDelay = additionalPing / 2
 }
 
 func (c *connection) GetClientUDPAddress() *net.UDPAddr {
@@ -77,12 +84,15 @@ func (c *connection) ForwardServerToClient(ctx context.Context, proxy *net.UDPCo
 			logger.Error(err)
 		}
 	}()
+
 	packets := make(chan []byte) // unbuffered
+
 	go func() {
 		if err := c.readFromServer(packets); err != nil {
 			logger.Error(err)
 		}
 	}()
+
 	for {
 		select {
 		case packet := <-packets:
@@ -92,6 +102,7 @@ func (c *connection) ForwardServerToClient(ctx context.Context, proxy *net.UDPCo
 					logger.Error(err)
 				}
 			}()
+
 		case <-ctx.Done():
 			logger.Info("context canceled, closing connection")
 			c.close()
@@ -107,6 +118,7 @@ func (c *connection) readFromServer(packets chan<- []byte) error {
 		if err != nil {
 			return err
 		}
+
 		data := make([]byte, bytesRead)
 		copy(data, buffer[:bytesRead])
 		packets <- data
@@ -120,10 +132,12 @@ func (c *connection) WriteToServerWithDelay(ctx context.Context, data []byte) er
 func writeToServerWithDelay(ctx context.Context, delay time.Duration, server UDPConn, data []byte) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
 	timer := time.AfterFunc(delay, func() {
 		err = writeToServer(server, data)
 		cancel()
 	})
+
 	<-ctx.Done() // done when write is done or context canceled externally
 	timer.Stop()
 	return err
@@ -132,10 +146,12 @@ func writeToServerWithDelay(ctx context.Context, delay time.Duration, server UDP
 func writeToClientWithDelay(ctx context.Context, delay time.Duration, proxy *net.UDPConn, client *net.UDPAddr, data []byte) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
 	timer := time.AfterFunc(delay, func() {
 		err = writeToClient(proxy, client, data)
 		cancel()
 	})
+
 	<-ctx.Done() // done when write is done or context is canceled externally
 	timer.Stop()
 	return err
@@ -148,6 +164,7 @@ func writeToClient(proxy UDPConn, client *net.UDPAddr, data []byte) error {
 	} else if bytesWritten != len(data) {
 		return fmt.Errorf("read %d bytes from server and wrote %d bytes to client", len(data), bytesWritten)
 	}
+
 	return nil
 }
 
@@ -158,5 +175,6 @@ func writeToServer(server UDPConn, data []byte) error {
 	} else if n != len(data) {
 		return fmt.Errorf("wrote %d bytes but data was %d bytes", n, len(data))
 	}
+
 	return nil
 }
