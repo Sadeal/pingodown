@@ -44,6 +44,8 @@ func (f *firewall) AddRedirect(port, redirectPort int) error {
 		"--to-port", fmt.Sprintf("%d", redirectPort),
 	)
 
+	// Suppress stderr since -C returns error if rule doesn't exist (that's expected)
+	checkCmd.Stderr = nil
 	if err := checkCmd.Run(); err == nil {
 		f.logger.Info("Redirect rule already exists for port %d -> %d", port, redirectPort)
 		return nil
@@ -56,6 +58,7 @@ func (f *firewall) AddRedirect(port, redirectPort int) error {
 		"-t", "nat",
 		"-A", "PREROUTING",
 		"-p", "udp",
+		"-d", "0.0.0.0/0",
 		"--dport", fmt.Sprintf("%d", port),
 		"-j", "REDIRECT",
 		"--to-port", fmt.Sprintf("%d", redirectPort),
