@@ -92,6 +92,7 @@ func (p *proxy) Run(ctx context.Context) error {
 				if err := p.state.UpdateClientPing(pingData.ClientIP, pingData.PingMS); err != nil {
 					p.logger.Error("Failed to update client ping: %v", err)
 				}
+				p.logger.Info("Updated ping for client %s: %d ms", pingData.ClientIP, pingData.PingMS)
 			case <-ctx.Done():
 				return
 			}
@@ -116,9 +117,13 @@ func (p *proxy) Run(ctx context.Context) error {
 					continue
 				}
 
-				// Start goroutine to monitor ping updates and apply delays
+				// Save connection
 				conn = p.state.SetConnection(conn)
+				
+				// Start server-to-client forwarding
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
+				
+				// Start goroutine to monitor and apply ping delays continuously
 				go p.monitorAndApplyPing(ctx, clientIP, conn)
 			}
 
@@ -137,32 +142,35 @@ func (p *proxy) Run(ctx context.Context) error {
 	}
 }
 
-// monitorAndApplyPing waits for ping data and applies delay when it arrives
+// monitorAndApplyPing continuously monitors ping data and applies/updates delay
 func (p *proxy) monitorAndApplyPing(ctx context.Context, clientIP string, conn connection.Connection) {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
-	pingApplied := false
+	lastAppliedPing := int64(-1) // Track last ping to avoid re-applying same value
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if pingApplied {
-				continue
-			}
-
-			// Try to get ping data
+			// Try to get current ping data
 			actualPing, err := p.state.GetClientPing(clientIP)
 			if err == nil {
-				// Got ping data - apply it
-				conn.SetPing(p.minPingMS, actualPing)
-				p.logger.Info("Applied ping for client %s: min=%d ms, actual=%d ms, additional=%d ms",
-					clientIP, p.minPingMS, actualPing, p.minPingMS-actualPing)
-				pingApplied = true
-				return
+				// Got ping data
+				if actualPing != lastAppliedPing {
+					// Ping changed or first time - apply it
+					conn.SetPing(p.minPingMS, actualPing)
+					additionalPing := p.minPingMS - actualPing
+					if additionalPing < 0 {
+						additionalPing = 0
+					}
+					p.logger.Info("Applied ping for client %s: min=%d ms, actual=%d ms, additional=%d ms",
+						clientIP, p.minPingMS, actualPing, additionalPing)
+					lastAppliedPing = actualPing
+				}
 			}
+			// If no ping data yet, continue waiting
 		}
 	}
 }
