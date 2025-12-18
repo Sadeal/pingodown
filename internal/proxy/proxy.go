@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/qdm12/golibs/logging"
@@ -18,26 +17,22 @@ type Proxy interface {
 }
 
 type proxy struct {
-	bufferSize      int
-	proxyConn       *net.UDPConn
-	serverAddress   *net.UDPAddr
-	state           state.State
-	logger          logging.Logger
-	minPingMS       int64
-	pingReceiver    ping_receiver.PingReceiver
-	connections     map[string]connection.Connection
-	connMutex       sync.Mutex
-	wg              sync.WaitGroup
+	bufferSize    int
+	proxyConn     *net.UDPConn
+	serverAddress *net.UDPAddr
+	state         state.State
+	logger        logging.Logger
+	minPingMS     int64
+	pingReceiver  ping_receiver.PingReceiver
 }
 
 func NewProxy(listenAddress, pingAddress, serverAddress string, logger logging.Logger, minPing time.Duration) (Proxy, error) {
 	s := state.NewState()
 	p := &proxy{
-		bufferSize:  65535,
-		state:       s,
-		logger:      logger,
-		minPingMS:   minPing.Milliseconds(),
-		connections: make(map[string]connection.Connection),
+		bufferSize: 65535,
+		state:      s,
+		logger:     logger,
+		minPingMS:  minPing.Milliseconds(),
 	}
 
 	// Create main proxy connection (for clients)
@@ -83,18 +78,14 @@ func (p *proxy) Run(ctx context.Context) error {
 	}
 
 	// Goroutine to read game packets from clients
-	p.wg.Add(1)
 	go func() {
-		defer p.wg.Done()
 		if err := readFromClients(p.proxyConn, packets, p.bufferSize); err != nil {
 			p.logger.Error("Error reading from clients: %v", err)
 		}
 	}()
 
 	// Goroutine to handle ping data updates
-	p.wg.Add(1)
 	go func() {
-		defer p.wg.Done()
 		for {
 			select {
 			case pingData := <-p.pingReceiver.GetDataChan():
@@ -103,9 +94,8 @@ func (p *proxy) Run(ctx context.Context) error {
 				}
 				p.logger.Info("Received ping %d ms from %s", pingData.PingMS, pingData.ClientIP)
 				
-				// If we have a connection for this client, apply the ping immediately
-				p.connMutex.Lock()
-				if conn, exists := p.connections[pingData.ClientIP]; exists {
+				// Try to get connection and apply ping if it exists
+				if conn, err := p.state.GetConnection(&net.UDPAddr{IP: net.ParseIP(pingData.ClientIP)}); err == nil {
 					additionalPing := p.minPingMS - pingData.PingMS
 					if additionalPing < 0 {
 						additionalPing = 0
@@ -118,7 +108,6 @@ func (p *proxy) Run(ctx context.Context) error {
 						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", pingData.PingMS, p.minPingMS)
 					}
 				}
-				p.connMutex.Unlock()
 			case <-ctx.Done():
 				return
 			}
@@ -143,13 +132,10 @@ func (p *proxy) Run(ctx context.Context) error {
 					continue
 				}
 
-				// Save connection
+				// Save connection in state
 				conn = p.state.SetConnection(conn)
-				p.connMutex.Lock()
-				p.connections[clientIP] = conn
-				p.connMutex.Unlock()
 				
-				// Check if we already have ping data for this client and apply it IMMEDIATELY
+				// Check if we already have ping data for this client
 				if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
 					additionalPing := p.minPingMS - actualPing
 					if additionalPing < 0 {
@@ -167,43 +153,20 @@ func (p *proxy) Run(ctx context.Context) error {
 				}
 				
 				// Start server-to-client forwarding
-				p.wg.Add(1)
-				go func(c connection.Connection) {
-					defer p.wg.Done()
-					c.ForwardServerToClient(ctx, p.proxyConn, p.logger)
-				}(conn)
+				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
 			}
 
 			// Forward packet to server with delay
-			func(c connection.Connection, data []byte) {
-				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
-					p.logger.Error("Error writing to server: %v", err)
-				}
-			}(conn, packet.data)
+			if err := conn.WriteToServerWithDelay(ctx, packet.data); err != nil {
+				p.logger.Error("Error writing to server: %v", err)
+			}
 
 		case <-ctx.Done():
-			p.logger.Info("Context canceled, closing connections and proxy")
-			p.closeAllConnections()
+			p.logger.Info("Context canceled, closing proxy connection")
 			p.pingReceiver.Close()
-			p.proxyConn.Close()
-			p.wg.Wait()
-			return nil
+			return p.proxyConn.Close()
 		}
 	}
-}
-
-// closeAllConnections closes all active client connections
-func (p *proxy) closeAllConnections() {
-	p.connMutex.Lock()
-	defer p.connMutex.Unlock()
-
-	for clientIP, conn := range p.connections {
-		p.logger.Info("Closing connection for client %s", clientIP)
-		if err := conn.Close(); err != nil {
-			p.logger.Error("Error closing connection for %s: %v", clientIP, err)
-		}
-	}
-	p.connections = make(map[string]connection.Connection)
 }
 
 func readFromClients(proxy *net.UDPConn, packets chan<- clientPacket, bufferSize int) error {
