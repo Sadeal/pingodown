@@ -11,31 +11,32 @@ import (
 )
 
 type Connection interface {
-	GetClientUDPAddress() *net.UDPAddr
+	GetClientUDPAddress() net.UDPAddr
 	ForwardServerToClient(ctx context.Context, proxy *net.UDPConn, logger logging.Logger)
 	WriteToServerWithDelay(ctx context.Context, data []byte) error
 	SetPing(minimumPingMS int64, clientActualPingMS int64)
+	Close() error
 }
 
-// Information maintained for each client/server connection
+// Information maintained for each client-server connection
 type connection struct {
-	clientAddress *net.UDPAddr
-	server        UDPConn
-	bufferSize    int
-	inboundDelay  time.Duration
-	outboundDelay time.Duration
+	clientAddress  net.UDPAddr
+	server         *net.UDPConn
+	bufferSize     int
+	inboundDelay   time.Duration
+	outboundDelay  time.Duration
 	sync.RWMutex
 }
 
 // Generate a new connection by opening a UDP connection to the server
 func NewConnection(serverAddress, clientAddress *net.UDPAddr, bufferSize int) (Connection, error) {
-	server, err := NewUDPConn(serverAddress)
+	server, err := net.DialUDP("udp", nil, serverAddress)
 	if err != nil {
 		return nil, err
 	}
 
 	return &connection{
-		clientAddress: clientAddress,
+		clientAddress: *clientAddress,
 		server:        server,
 		bufferSize:    bufferSize,
 	}, nil
@@ -43,6 +44,10 @@ func NewConnection(serverAddress, clientAddress *net.UDPAddr, bufferSize int) (C
 
 func (c *connection) close() error {
 	return c.server.Close()
+}
+
+func (c *connection) Close() error {
+	return c.close()
 }
 
 func (c *connection) getInboundDelay() time.Duration {
@@ -73,15 +78,15 @@ func (c *connection) SetPing(minimumPingMS int64, clientActualPingMS int64) {
 	c.outboundDelay = additionalPing / 2
 }
 
-func (c *connection) GetClientUDPAddress() *net.UDPAddr {
+func (c *connection) GetClientUDPAddress() net.UDPAddr {
 	return c.clientAddress
 }
 
 func (c *connection) ForwardServerToClient(ctx context.Context, proxy *net.UDPConn, logger logging.Logger) {
 	defer func() {
-		logger.Info("closing connection with client %s", c.clientAddress)
+		logger.Info("Closing connection with client %s", c.clientAddress)
 		if err := c.close(); err != nil {
-			logger.Error(err)
+			logger.Error("Error closing connection: %v", err)
 		}
 	}()
 
@@ -89,22 +94,21 @@ func (c *connection) ForwardServerToClient(ctx context.Context, proxy *net.UDPCo
 
 	go func() {
 		if err := c.readFromServer(packets); err != nil {
-			logger.Error(err)
+			logger.Error("Error reading from server: %v", err)
 		}
 	}()
 
 	for {
 		select {
 		case packet := <-packets:
-			go func() {
-				err := writeToClientWithDelay(ctx, c.getOutboundDelay(), proxy, c.clientAddress, packet)
+			go func(data []byte) {
+				err := writeToClientWithDelay(ctx, c.getOutboundDelay(), proxy, &c.clientAddress, data)
 				if err != nil {
-					logger.Error(err)
+					logger.Error("Error: %v", err)
 				}
-			}()
-
+			}(packet)
 		case <-ctx.Done():
-			logger.Info("context canceled, closing connection")
+			logger.Info("Context canceled, closing connection")
 			c.close()
 			return
 		}
@@ -129,16 +133,15 @@ func (c *connection) WriteToServerWithDelay(ctx context.Context, data []byte) er
 	return writeToServerWithDelay(ctx, c.getInboundDelay(), c.server, data)
 }
 
-func writeToServerWithDelay(ctx context.Context, delay time.Duration, server UDPConn, data []byte) (err error) {
+func writeToServerWithDelay(ctx context.Context, delay time.Duration, server *net.UDPConn, data []byte) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	timer := time.AfterFunc(delay, func() {
 		err = writeToServer(server, data)
-		cancel()
+		cancel() // Done when write is done or context canceled externally
 	})
 
-	<-ctx.Done() // done when write is done or context canceled externally
 	timer.Stop()
 	return err
 }
@@ -149,32 +152,29 @@ func writeToClientWithDelay(ctx context.Context, delay time.Duration, proxy *net
 
 	timer := time.AfterFunc(delay, func() {
 		err = writeToClient(proxy, client, data)
-		cancel()
+		cancel() // Done when write is done or context is canceled externally
 	})
 
-	<-ctx.Done() // done when write is done or context is canceled externally
 	timer.Stop()
 	return err
 }
 
-func writeToClient(proxy UDPConn, client *net.UDPAddr, data []byte) error {
+func writeToClient(proxy *net.UDPConn, client *net.UDPAddr, data []byte) error {
 	bytesWritten, err := proxy.WriteToUDP(data, client)
 	if err != nil {
 		return err
 	} else if bytesWritten != len(data) {
 		return fmt.Errorf("read %d bytes from server and wrote %d bytes to client", len(data), bytesWritten)
 	}
-
 	return nil
 }
 
-func writeToServer(server UDPConn, data []byte) error {
+func writeToServer(server *net.UDPConn, data []byte) error {
 	n, err := server.Write(data)
 	if err != nil {
 		return err
 	} else if n != len(data) {
 		return fmt.Errorf("wrote %d bytes but data was %d bytes", n, len(data))
 	}
-
 	return nil
 }
