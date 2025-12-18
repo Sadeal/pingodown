@@ -157,9 +157,11 @@ func (p *proxy) Run(ctx context.Context) error {
 			}
 
 			// Forward packet to server with delay
-			if err := conn.WriteToServerWithDelay(ctx, packet.data); err != nil {
-				p.logger.Error("Error writing to server: %v", err)
-			}
+			go func(c connection.Connection, data []byte) {
+				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
+					p.logger.Error("Error writing to server: %v", err)
+				}
+			}(conn, packet.data)
 
 		case <-ctx.Done():
 			p.logger.Info("Context canceled, closing proxy connection")

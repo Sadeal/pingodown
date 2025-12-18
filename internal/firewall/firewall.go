@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 
 	"github.com/qdm12/golibs/logging"
 )
@@ -33,18 +32,25 @@ func (f *firewall) AddRedirect(port, redirectPort int) error {
 		return fmt.Errorf("port redirection requires root privileges, run with 'sudo'")
 	}
 
-	// Check if rule already exists
-	checkCmd := exec.Command("iptables", "-t", "nat", "-L", "PREROUTING", "-n", "-v")
-	output, err := checkCmd.CombinedOutput()
-	if err == nil {
-		outputStr := string(output)
-		if strings.Contains(outputStr, fmt.Sprintf("tcp dpt:%d", port)) {
-			f.logger.Info("Redirect rule already exists for port %d -> %d", port, redirectPort)
-			return nil
-		}
+	// Check if rule already exists using -C (check) flag
+	f.logger.Info("Checking if redirect rule already exists for port %d -> %d", port, redirectPort)
+	checkCmd := exec.Command(
+		"iptables",
+		"-t", "nat",
+		"-C", "PREROUTING",
+		"-p", "udp",
+		"--dport", fmt.Sprintf("%d", port),
+		"-j", "REDIRECT",
+		"--to-port", fmt.Sprintf("%d", redirectPort),
+	)
+
+	if err := checkCmd.Run(); err == nil {
+		f.logger.Info("Redirect rule already exists for port %d -> %d", port, redirectPort)
+		return nil
 	}
 
-	// Add redirect rule: all traffic to port 27055 -> 27056
+	// Add redirect rule: all traffic to port -> redirectPort (UDP)
+	f.logger.Info("Adding iptables redirect rule: %d -> %d", port, redirectPort)
 	cmd := exec.Command(
 		"iptables",
 		"-t", "nat",
@@ -55,11 +61,13 @@ func (f *firewall) AddRedirect(port, redirectPort int) error {
 		"--to-port", fmt.Sprintf("%d", redirectPort),
 	)
 
-	if err := cmd.Run(); err != nil {
+	if output, err := cmd.CombinedOutput(); err != nil {
+		errMsg := string(output)
+		f.logger.Error("Failed to add iptables redirect rule: %v, output: %s", err, errMsg)
 		return fmt.Errorf("failed to add iptables redirect rule: %w", err)
 	}
 
-	f.logger.Info("Added iptables redirect: %d -> %d", port, redirectPort)
+	f.logger.Info("Successfully added iptables redirect: %d -> %d", port, redirectPort)
 	return nil
 }
 
@@ -72,6 +80,7 @@ func (f *firewall) RemoveRedirect(port, redirectPort int) error {
 	}
 
 	// Remove redirect rule
+	f.logger.Info("Removing iptables redirect rule: %d -> %d", port, redirectPort)
 	cmd := exec.Command(
 		"iptables",
 		"-t", "nat",
@@ -82,12 +91,13 @@ func (f *firewall) RemoveRedirect(port, redirectPort int) error {
 		"--to-port", fmt.Sprintf("%d", redirectPort),
 	)
 
-	if err := cmd.Run(); err != nil {
-		f.logger.Warn("Failed to remove iptables redirect rule: %v (it may not exist)", err)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		errMsg := string(output)
+		f.logger.Warn("Failed to remove iptables redirect rule: %v, output: %s (it may not exist)", err, errMsg)
 		// Not fatal - rule might not exist
 		return nil
 	}
 
-	f.logger.Info("Removed iptables redirect: %d -> %d", port, redirectPort)
+	f.logger.Info("Successfully removed iptables redirect: %d -> %d", port, redirectPort)
 	return nil
 }
