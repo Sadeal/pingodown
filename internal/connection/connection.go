@@ -2,7 +2,6 @@ package connection
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"sync"
 	"time"
