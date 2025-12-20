@@ -69,24 +69,6 @@ func (f *firewall) AddRedirect(port, redirectPort int) error {
 		return fmt.Errorf("failed to add iptables redirect rule: %w", err)
 	}
 
-	// Also add OUTPUT rule for local traffic
-	f.logger.Info("Adding iptables OUTPUT rule for local traffic: %d -> %d", port, redirectPort)
-	cmdOutput := exec.Command(
-		"iptables",
-		"-t", "nat",
-		"-A", "OUTPUT",
-		"-p", "udp",
-		"-d", "127.0.0.1",
-		"--dport", fmt.Sprintf("%d", port),
-		"-j", "REDIRECT",
-		"--to-port", fmt.Sprintf("%d", redirectPort),
-	)
-
-	if output, err := cmdOutput.CombinedOutput(); err != nil {
-		errMsg := string(output)
-		f.logger.Warn("Failed to add OUTPUT rule (optional): %v, output: %s", err, errMsg)
-	}
-
 	f.logger.Info("Successfully added iptables redirect: %d -> %d", port, redirectPort)
 	return nil
 }
