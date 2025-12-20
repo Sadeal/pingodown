@@ -9,8 +9,8 @@ import (
 )
 
 type Firewall interface {
-	AddRedirect(port, redirectPort int) error
-	RemoveRedirect(port, redirectPort int) error
+	AddRedirect(port, redirectPort int, externalIP string) error
+	RemoveRedirect(port, redirectPort int, externalIP string) error
 }
 
 type firewall struct {
@@ -23,83 +23,73 @@ func NewFirewall(logger logging.Logger) Firewall {
 	}
 }
 
-// AddRedirect adds iptables rule to redirect port to redirectPort
-// Example: AddRedirect(27055, 27056) redirects 27055 -> 27056
-func (f *firewall) AddRedirect(port, redirectPort int) error {
-	// Check if running as root
+// AddRedirect adds iptables rules:
+// 1. PREROUTING: Redirect incoming traffic port -> redirectPort
+// 2. POSTROUTING: SNAT outgoing traffic from redirectPort -> port (masquerade as original port)
+func (f *firewall) AddRedirect(port, redirectPort int, externalIP string) error {
 	if os.Geteuid() != 0 {
 		f.logger.Error("Port redirection requires root privileges")
 		return fmt.Errorf("port redirection requires root privileges, run with 'sudo'")
 	}
 
-	// Check if rule already exists using -C (check) flag
-	f.logger.Info("Checking if redirect rule already exists for port %d -> %d", port, redirectPort)
-	checkCmd := exec.Command(
-		"iptables",
-		"-t", "nat",
-		"-C", "PREROUTING",
-		"-p", "udp",
-		"--dport", fmt.Sprintf("%d", port),
-		"-j", "REDIRECT",
-		"--to-port", fmt.Sprintf("%d", redirectPort),
-	)
+	// 1. INCOMING: Redirect 27055 -> 27056
+	// iptables -t nat -A PREROUTING -p udp --dport 27055 -j REDIRECT --to-port 27056
+	f.runRule("PREROUTING", "-p", "udp", "--dport", fmt.Sprintf("%d", port), "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", redirectPort))
 
-	// Suppress stderr since -C returns error if rule doesn't exist (that's expected)
-	checkCmd.Stderr = nil
-	if err := checkCmd.Run(); err == nil {
-		f.logger.Info("Redirect rule already exists for port %d -> %d", port, redirectPort)
-		return nil
+	// 2. OUTGOING: SNAT 27056 -> 27055
+	// This ensures packets sent by our proxy (on 27056) look like they come from 27055
+	// iptables -t nat -A POSTROUTING -p udp --sport 27056 -j SNAT --to-source IP:27055
+	snatTarget := fmt.Sprintf("%s:%d", externalIP, port)
+	err := f.runRule("POSTROUTING", "-p", "udp", "--sport", fmt.Sprintf("%d", redirectPort), "-j", "SNAT", "--to-source", snatTarget)
+	
+	if err != nil {
+		f.logger.Error("Failed to add SNAT rule: %v", err)
+		// Try to cleanup PREROUTING if SNAT fails
+		f.RemoveRedirect(port, redirectPort, externalIP)
+		return err
 	}
 
-	// Add redirect rule: all traffic to port -> redirectPort (UDP)
-	f.logger.Info("Adding iptables redirect rule: %d -> %d", port, redirectPort)
-	cmd := exec.Command(
-		"iptables",
-		"-t", "nat",
-		"-A", "PREROUTING",
-		"-p", "udp",
-		"--dport", fmt.Sprintf("%d", port),
-		"-j", "REDIRECT",
-		"--to-port", fmt.Sprintf("%d", redirectPort),
-	)
-
-	if output, err := cmd.CombinedOutput(); err != nil {
-		errMsg := string(output)
-		f.logger.Error("Failed to add iptables redirect rule: %v, output: %s", err, errMsg)
-		return fmt.Errorf("failed to add iptables redirect rule: %w", err)
-	}
-
-	f.logger.Info("Successfully added iptables redirect: %d -> %d", port, redirectPort)
+	f.logger.Info("Firewall rules configured: Incoming %d->%d, Outgoing Source %d->%d", port, redirectPort, redirectPort, port)
 	return nil
 }
 
-// RemoveRedirect removes iptables rule for port redirection
-func (f *firewall) RemoveRedirect(port, redirectPort int) error {
-	// Check if running as root
+func (f *firewall) RemoveRedirect(port, redirectPort int, externalIP string) error {
 	if os.Geteuid() != 0 {
-		f.logger.Error("Port redirection removal requires root privileges")
-		return fmt.Errorf("port redirection removal requires root privileges, run with 'sudo'")
-	}
-
-	// Remove redirect rule - MUST match exactly what was added
-	f.logger.Info("Removing iptables redirect rule: %d -> %d", port, redirectPort)
-	cmd := exec.Command(
-		"iptables",
-		"-t", "nat",
-		"-D", "PREROUTING",
-		"-p", "udp",
-		"--dport", fmt.Sprintf("%d", port),
-		"-j", "REDIRECT",
-		"--to-port", fmt.Sprintf("%d", redirectPort),
-	)
-
-	if output, err := cmd.CombinedOutput(); err != nil {
-		errMsg := string(output)
-		f.logger.Warn("Failed to remove iptables redirect rule: %v, output: %s (it may not exist)", err, errMsg)
-		// Not fatal - rule might not exist
 		return nil
 	}
 
-	f.logger.Info("Successfully removed iptables redirect: %d -> %d", port, redirectPort)
+	f.logger.Info("Removing firewall rules...")
+
+	// Remove PREROUTING
+	f.removeRule("PREROUTING", "-p", "udp", "--dport", fmt.Sprintf("%d", port), "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", redirectPort))
+
+	// Remove POSTROUTING
+	snatTarget := fmt.Sprintf("%s:%d", externalIP, port)
+	f.removeRule("POSTROUTING", "-p", "udp", "--sport", fmt.Sprintf("%d", redirectPort), "-j", "SNAT", "--to-source", snatTarget)
+
+	return nil
+}
+
+// Helper to check and add rule
+func (f *firewall) runRule(chain string, args ...string) error {
+	// 1. Check if exists
+	checkArgs := append([]string{"-t", "nat", "-C", chain}, args...)
+	if err := exec.Command("iptables", checkArgs...).Run(); err == nil {
+		return nil // Rule exists
+	}
+
+	// 2. Add rule
+	addArgs := append([]string{"-t", "nat", "-A", chain}, args...)
+	cmd := exec.Command("iptables", addArgs...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("iptables error: %v, output: %s", err, string(output))
+	}
+	return nil
+}
+
+// Helper to remove rule
+func (f *firewall) removeRule(chain string, args ...string) error {
+	delArgs := append([]string{"-t", "nat", "-D", chain}, args...)
+	exec.Command("iptables", delArgs...).Run() // Ignore errors if rule doesn't exist
 	return nil
 }
