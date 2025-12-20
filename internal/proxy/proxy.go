@@ -36,7 +36,7 @@ func NewProxy(listenAddress, serverAddress string, logger logging.Logger, minPin
 		minPingMS:  minPing.Milliseconds(),
 	}
 
-	// Create main proxy connection (binds to ServerPort)
+	// Create main proxy connection (ListenPort)
 	var err error
 	proxyAddr, err := net.ResolveUDPAddr("udp", listenAddress)
 	if err != nil {
@@ -48,13 +48,13 @@ func NewProxy(listenAddress, serverAddress string, logger logging.Logger, minPin
 		return nil, fmt.Errorf("failed to listen on proxy address: %w", err)
 	}
 
-	// Resolve server address (Docker Internal IP:PORT)
+	// Resolve target server address (Docker IP or Localhost)
 	p.serverAddress, err = net.ResolveUDPAddr("udp", serverAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve server address: %w", err)
 	}
 
-	// Create ping receiver (Active Pinger)
+	// Create active ping receiver
 	p.pingReceiver, err = ping_receiver.NewPingReceiver(logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ping receiver: %w", err)
@@ -69,7 +69,7 @@ type clientPacket struct {
 }
 
 func (p *proxy) Run(ctx context.Context) error {
-	p.logger.Info("Running proxy. Listening on %s -> Forwarding to %s", p.proxyConn.LocalAddr(), p.serverAddress)
+	p.logger.Info("Proxy started: Listening on %s -> Forwarding to %s", p.proxyConn.LocalAddr(), p.serverAddress)
 	packets := make(chan clientPacket, 100)
 
 	// Start ping receiver
@@ -89,22 +89,15 @@ func (p *proxy) Run(ctx context.Context) error {
 		for {
 			select {
 			case pingData := <-p.pingReceiver.GetDataChan():
+				// Update state
 				if err := p.state.UpdateClientPing(pingData.ClientIP, pingData.PingMS); err != nil {
 					p.logger.Error("Failed to update client ping: %v", err)
 					continue
 				}
 
-				// Try to get connection and apply ping if it exists
+				// Apply delay to existing connection
 				if conn, err := p.state.GetConnection(&net.UDPAddr{IP: net.ParseIP(pingData.ClientIP)}); err == nil {
-					additionalPing := p.minPingMS - pingData.PingMS
-					if additionalPing < 0 {
-						additionalPing = 0
-					}
-
-					if additionalPing > 0 {
-						conn.SetPing(p.minPingMS, pingData.PingMS)
-						// p.logger.Info("Adjusted delay for %s: ping %d ms -> add %d ms", pingData.ClientIP, pingData.PingMS, additionalPing)
-					}
+					conn.SetPing(p.minPingMS, pingData.PingMS)
 				}
 			case <-ctx.Done():
 				return
@@ -116,34 +109,32 @@ func (p *proxy) Run(ctx context.Context) error {
 	for {
 		select {
 		case packet := <-packets:
-			// Check if packet is from ourselves (Docker reflection or loopback)
+			// 1. FILTER SELF/LOCAL TRAFFIC
+			// Prevents infinite loops and processing packets from Docker gateway/Localhost
 			if net_utils.IsLocalIP(packet.clientAddress.IP.String()) {
-				// Silently ignore packets from self/docker gateway to prevent loops
 				continue
 			}
 
 			conn, err := p.state.GetConnection(packet.clientAddress)
 			if err != nil {
-				p.logger.Info("New client %s connecting", packet.clientAddress)
-				clientIP := packet.clientAddress.IP.String()
+				p.logger.Info("New client detected: %s", packet.clientAddress)
+				
+				// 2. Start Active Pinging for this client
+				p.pingReceiver.AddIP(packet.clientAddress.IP.String())
 
-				// Register IP for active pinging
-				p.pingReceiver.AddIP(clientIP)
-
-				// Create connection immediately
+				// Create connection
 				conn, err = connection.NewConnection(p.serverAddress, packet.clientAddress, p.bufferSize)
 				if err != nil {
 					p.logger.Error("Failed to create connection: %v", err)
 					continue
 				}
-
 				conn = p.state.SetConnection(conn)
 
-				// Start server-to-client forwarding
+				// Start backward forwarding (Server -> Client)
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
 			}
 
-			// Forward packet to Docker server
+			// Forward packet (Client -> Server) with delay logic embedded in connection
 			go func(c connection.Connection, data []byte) {
 				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
 					p.logger.Error("Error writing to server: %v", err)
@@ -151,7 +142,7 @@ func (p *proxy) Run(ctx context.Context) error {
 			}(conn, packet.data)
 
 		case <-ctx.Done():
-			p.logger.Info("Context canceled, closing proxy connection")
+			p.logger.Info("Stopping proxy...")
 			p.pingReceiver.Close()
 			return p.proxyConn.Close()
 		}

@@ -3,6 +3,7 @@ package net_utils
 import (
 	"fmt"
 	"net"
+	"strings"
 )
 
 // GetServerExternalIP returns the external IP of the current server
@@ -37,13 +38,13 @@ func GetServerExternalIP() (string, error) {
 	return "", fmt.Errorf("no valid external IP found on any interface")
 }
 
-// IsLocalIP checks if the given IP string belongs to the local machine
+// IsLocalIP checks if the given IP string belongs to the local machine (including Docker gateway)
 func IsLocalIP(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
-	
+
 	// Check loopback
 	if ip.IsLoopback() {
 		return true
@@ -71,6 +72,20 @@ func IsLocalIP(ipStr string) bool {
 			if localIP.Equal(ip) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// IsDockerPresent checks if the docker0 interface exists
+func IsDockerPresent() bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, i := range ifaces {
+		if strings.Contains(i.Name, "docker") {
+			return true
 		}
 	}
 	return false

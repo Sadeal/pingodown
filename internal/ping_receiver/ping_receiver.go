@@ -43,9 +43,12 @@ func (pr *pingReceiver) GetDataChan() <-chan PingData {
 	return pr.dataChan
 }
 
+// AddIP registers a new IP to be pinged
 func (pr *pingReceiver) AddIP(ip string) {
 	pr.targetsLock.Lock()
 	defer pr.targetsLock.Unlock()
+	
+	// Only add if not already present
 	if _, exists := pr.targets[ip]; !exists {
 		pr.targets[ip] = time.Now()
 		pr.logger.Info("Started monitoring ping for %s", ip)
@@ -53,15 +56,15 @@ func (pr *pingReceiver) AddIP(ip string) {
 }
 
 func (pr *pingReceiver) Start(ctx context.Context) error {
-	// Listen for ICMP packets (requires root)
+	// Listen for ICMP packets (requires root/sudo)
 	conn, err := net.ListenIP("ip4:icmp", &net.IPAddr{IP: net.ParseIP("0.0.0.0")})
 	if err != nil {
 		return fmt.Errorf("failed to listen for ICMP: %w (ensure you are running as root)", err)
 	}
 	pr.conn = conn
-	pr.logger.Info("Pinger started (ICMP)")
+	pr.logger.Info("Pinger started (ICMP Mode)")
 
-	// Routine to read replies
+	// Routine to read ICMP replies
 	go func() {
 		buf := make([]byte, 1500)
 		for {
@@ -74,19 +77,21 @@ func (pr *pingReceiver) Start(ctx context.Context) error {
 				if err != nil {
 					continue
 				}
-				
+
 				// Process ICMP Echo Reply (Type 0)
-				if n > 0 && buf[0] == 0 { 
-					// Simple RTT calculation based on time since we last pinged this specific IP
-					// Note: A more robust impl would match Sequence IDs, but for a game proxy this is sufficient
+				// Basic implementation: matches any reply from the IP to the last sent time
+				if n > 0 && buf[0] == 0 {
+					clientIP := addr.IP.String()
+					
 					pr.targetsLock.RLock()
-					sentTime, ok := pr.targets[addr.IP.String()]
+					sentTime, ok := pr.targets[clientIP]
 					pr.targetsLock.RUnlock()
 
 					if ok {
 						rtt := time.Since(sentTime).Milliseconds()
+						// Send update non-blocking
 						select {
-						case pr.dataChan <- PingData{ClientIP: addr.IP.String(), PingMS: rtt}:
+						case pr.dataChan <- PingData{ClientIP: clientIP, PingMS: rtt}:
 						default:
 						}
 					}
@@ -95,11 +100,12 @@ func (pr *pingReceiver) Start(ctx context.Context) error {
 		}
 	}()
 
-	// Routine to send pings
+	// Routine to send ICMP Echo Requests
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(1 * time.Second) // Ping every second
 		defer ticker.Stop()
 		seq := 0
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -111,23 +117,22 @@ func (pr *pingReceiver) Start(ctx context.Context) error {
 					if ip == nil {
 						continue
 					}
-					
-					// Update send time
+
+					// Update send time for RTT calculation
 					pr.targets[ipStr] = time.Now()
 
 					// Construct ICMP Echo Request
 					// Type(8), Code(0), Checksum(0), ID, Seq, Payload
-					msg := make([]byte, 8+8) // Header + 8 bytes payload
-					msg[0] = 8 // Echo Request
-					msg[1] = 0
+					msg := make([]byte, 8+8) 
+					msg[0] = 8 // Type: Echo Request
+					msg[1] = 0 // Code: 0
 					msg[2] = 0 // Checksum placeholder
 					msg[3] = 0
-					
 					msg[4] = 0 // ID
 					msg[5] = 1
 					msg[6] = byte(seq >> 8)
 					msg[7] = byte(seq)
-					
+
 					// Calculate Checksum
 					check := checkSum(msg)
 					msg[2] = byte(check >> 8)
@@ -153,6 +158,7 @@ func (pr *pingReceiver) Close() error {
 	return nil
 }
 
+// Calculate standard Internet Checksum
 func checkSum(msg []byte) uint16 {
 	sum := 0
 	for n := 0; n < len(msg)-1; n += 2 {
