@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/qdm12/golibs/logging"
 	"github.com/qdm12/pingodown/internal/connection"
-	"github.com/qdm12/pingodown/internal/ping_receiver"
 	"github.com/qdm12/pingodown/internal/state"
 )
 
@@ -23,166 +23,137 @@ type proxy struct {
 	state         state.State
 	logger        logging.Logger
 	minPingMS     int64
-	pingReceiver  ping_receiver.PingReceiver
 }
 
-func NewProxy(listenAddress, pingAddress, serverAddress string, logger logging.Logger, minPing time.Duration) (Proxy, error) {
+func NewProxy(listenAddress, serverAddress string, logger logging.Logger, minPing time.Duration) (Proxy, error) {
 	s := state.NewState()
-	p := &proxy{
-		bufferSize: 65535,
-		state:      s,
-		logger:     logger,
-		minPingMS:  minPing.Milliseconds(),
-	}
 
-	// Create main proxy connection (for clients)
-	var err error
-	proxyAddress, err := net.ResolveUDPAddr("udp", listenAddress)
+	proxyAddr, err := net.ResolveUDPAddr("udp", listenAddress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve proxy address: %w", err)
+		return nil, fmt.Errorf("resolve proxy addr: %w", err)
 	}
 
-	p.proxyConn, err = net.ListenUDP("udp", proxyAddress)
+	proxyConn, err := net.ListenUDP("udp", proxyAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen on proxy address: %w", err)
+		return nil, fmt.Errorf("listen proxy: %w", err)
 	}
 
-	// Resolve server address (external IP:PORT)
-	p.serverAddress, err = net.ResolveUDPAddr("udp", serverAddress)
+	targetAddr, err := net.ResolveUDPAddr("udp", serverAddress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve server address: %w", err)
+		return nil, fmt.Errorf("resolve server addr: %w", err)
 	}
 
-	// Create ping receiver
-	p.pingReceiver, err = ping_receiver.NewPingReceiver(pingAddress, logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ping receiver: %w", err)
-	}
-
-	return p, nil
+	return &proxy{
+		bufferSize:    65535,
+		proxyConn:     proxyConn,
+		serverAddress: targetAddr,
+		state:         s,
+		logger:        logger,
+		minPingMS:     minPing.Milliseconds(),
+	}, nil
 }
 
 type clientPacket struct {
 	clientAddress *net.UDPAddr
 	data          []byte
+	receivedAt    time.Time
 }
 
 func (p *proxy) Run(ctx context.Context) error {
-	p.logger.Info("Running proxy to %s on %s", p.serverAddress, p.proxyConn.LocalAddr())
-
+	p.logger.Info("Proxy running. Forwarding %s <-> %s", p.proxyConn.LocalAddr(), p.serverAddress)
+	
 	packets := make(chan clientPacket, 100)
 
-	// Start ping receiver
-	if err := p.pingReceiver.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start ping receiver: %w", err)
-	}
-
-	// Goroutine to read game packets from clients
+	// Read Loop
 	go func() {
-		if err := readFromClients(p.proxyConn, packets, p.bufferSize); err != nil {
-			p.logger.Error("Error reading from clients: %v", err)
-		}
-	}()
-
-	// Goroutine to handle ping data updates
-	go func() {
+		buf := make([]byte, p.bufferSize)
 		for {
-			select {
-			case pingData := <-p.pingReceiver.GetDataChan():
-				if err := p.state.UpdateClientPing(pingData.ClientIP, pingData.PingMS); err != nil {
-					p.logger.Error("Failed to update client ping: %v", err)
+			n, addr, err := p.proxyConn.ReadFromUDP(buf)
+			if err != nil {
+				if ctx.Err() == nil {
+					p.logger.Error("Read error: %v", err)
 				}
-				p.logger.Info("Received ping %d ms from %s", pingData.PingMS, pingData.ClientIP)
-				
-				// Try to get connection and apply ping if it exists
-				if conn, err := p.state.GetConnection(&net.UDPAddr{IP: net.ParseIP(pingData.ClientIP)}); err == nil {
-					additionalPing := p.minPingMS - pingData.PingMS
-					if additionalPing < 0 {
-						additionalPing = 0
-					}
-					
-					if additionalPing > 0 {
-						conn.SetPing(p.minPingMS, pingData.PingMS)
-						p.logger.Info("Saw ping %d, ping is below %d ms, adding %d ms delay", pingData.PingMS, p.minPingMS, additionalPing)
-					} else {
-						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", pingData.PingMS, p.minPingMS)
-					}
-				}
-			case <-ctx.Done():
 				return
 			}
+			
+			// Self-traffic protection
+			if addr.IP.Equal(p.serverAddress.IP) || addr.IP.IsLoopback() {
+				continue 
+			}
+
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			packets <- clientPacket{clientAddress: addr, data: data, receivedAt: time.Now()}
 		}
 	}()
 
-	// Main packet processing loop
+	// Processing Loop
 	for {
 		select {
 		case packet := <-packets:
+			clientIP := packet.clientAddress.IP.String()
 			conn, err := p.state.GetConnection(packet.clientAddress)
-			if err != nil {
-				p.logger.Info("New client %s connecting", packet.clientAddress)
-				
-				// Get client IP from address
-				clientIP := packet.clientAddress.IP.String()
 
-				// Create connection immediately
+			// 1. New Client Handling
+			if err != nil {
+				p.logger.Info("New client detected: %s", packet.clientAddress)
 				conn, err = connection.NewConnection(p.serverAddress, packet.clientAddress, p.bufferSize)
 				if err != nil {
 					p.logger.Error("Failed to create connection: %v", err)
 					continue
 				}
-
-				// Save connection in state
 				conn = p.state.SetConnection(conn)
 				
-				// Check if we already have ping data for this client
-				if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
-					additionalPing := p.minPingMS - actualPing
-					if additionalPing < 0 {
-						additionalPing = 0
-					}
-					
-					if additionalPing > 0 {
-						conn.SetPing(p.minPingMS, actualPing)
-						p.logger.Info("Saw ping %d, ping is below %d ms, adding %d ms delay", actualPing, p.minPingMS, additionalPing)
-					} else {
-						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", actualPing, p.minPingMS)
-					}
-				} else {
-					p.logger.Info("No ping data yet for client %s, will apply when ping arrives", clientIP)
-				}
-				
-				// Start server-to-client forwarding
+				// Start async forwarder (Server -> Client)
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
 			}
 
-			go func(c connection.Connection, data []byte) {
-				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
-					p.logger.Error("Error writing to server: %v", err)
+			// 2. Passive Ping Calculation (The "Ping-Pong" Strategy)
+			// If we sent a packet to this client recently, this incoming packet 
+			// gives us a rough RTT estimate: (Now - LastSendTime)
+			lastSent := conn.GetLastSentToClient()
+			if !lastSent.IsZero() {
+				rtt := packet.receivedAt.Sub(lastSent).Milliseconds()
+				
+				// Sanity check: Ping < 1s (ignore idle timeouts/connects)
+				if rtt > 0 && rtt < 1000 {
+					// Update State (You might want to add averaging in state.go)
+					p.state.UpdateClientPing(clientIP, rtt)
+					
+					// Apply Delay Logic
+					p.applyDelay(conn, rtt, clientIP)
+				}
+			}
+
+			// 3. Forward Client -> Server
+			go func(c connection.Connection, d []byte) {
+				if err := c.WriteToServerWithDelay(ctx, d); err != nil {
+					p.logger.Error("Write to server failed: %v", err)
 				}
 			}(conn, packet.data)
 
 		case <-ctx.Done():
-			p.logger.Info("Context canceled, closing proxy connection")
-			p.pingReceiver.Close()
-			return p.proxyConn.Close()
+			p.proxyConn.Close()
+			return nil
 		}
 	}
 }
 
-func readFromClients(proxy *net.UDPConn, packets chan<- clientPacket, bufferSize int) error {
-	buffer := make([]byte, bufferSize)
-	for {
-		bytesRead, clientAddress, err := proxy.ReadFromUDP(buffer)
-		if err != nil {
-			return fmt.Errorf("error reading from UDP: %w", err)
-		}
-
-		data := make([]byte, bytesRead)
-		copy(data, buffer[:bytesRead])
-		packets <- clientPacket{
-			clientAddress: clientAddress,
-			data:          data,
-		}
+func (p *proxy) applyDelay(conn connection.Connection, actualPing int64, clientIP string) {
+	neededDelay := p.minPingMS - actualPing
+	if neededDelay <= 0 {
+		// Ping is high enough, no artificial delay needed
+		conn.SetPing(p.minPingMS, actualPing) // Updates internal stats, sets delay to 0
+		return
+	}
+	
+	// Check if delay changed significantly to avoid spam
+	prevDelay := conn.GetOutboundDelay()
+	newDelayDuration := time.Duration(neededDelay/2) * time.Millisecond
+	
+	if (newDelayDuration - prevDelay).Abs() > 5*time.Millisecond {
+		p.logger.Info("Client %s: Ping %d ms (Target %d ms). Adding %d ms delay.", 
+			clientIP, actualPing, p.minPingMS, neededDelay)
+		conn.SetPing(p.minPingMS, actualPing)
 	}
 }
