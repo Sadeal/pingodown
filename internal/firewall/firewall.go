@@ -23,33 +23,44 @@ func NewFirewall(logger logging.Logger) Firewall {
 	}
 }
 
-// AddRedirect adds iptables rules:
-// 1. PREROUTING: Redirect incoming traffic port -> redirectPort
-// 2. POSTROUTING: SNAT outgoing traffic from redirectPort -> port (masquerade as original port)
+// AddRedirect adds iptables rules with high priority (-I) to override Docker
 func (f *firewall) AddRedirect(port, redirectPort int, externalIP string) error {
 	if os.Geteuid() != 0 {
 		f.logger.Error("Port redirection requires root privileges")
 		return fmt.Errorf("port redirection requires root privileges, run with 'sudo'")
 	}
 
-	// 1. INCOMING: Redirect 27055 -> 27056
-	// iptables -t nat -A PREROUTING -p udp --dport 27055 -j REDIRECT --to-port 27056
-	f.runRule("PREROUTING", "-p", "udp", "--dport", fmt.Sprintf("%d", port), "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", redirectPort))
-
-	// 2. OUTGOING: SNAT 27056 -> 27055
-	// This ensures packets sent by our proxy (on 27056) look like they come from 27055
-	// iptables -t nat -A POSTROUTING -p udp --sport 27056 -j SNAT --to-source IP:27055
+	p := fmt.Sprintf("%d", port)
+	rp := fmt.Sprintf("%d", redirectPort)
 	snatTarget := fmt.Sprintf("%s:%d", externalIP, port)
-	err := f.runRule("POSTROUTING", "-p", "udp", "--sport", fmt.Sprintf("%d", redirectPort), "-j", "SNAT", "--to-source", snatTarget)
-	
+
+	// 1. INCOMING: Redirect port -> redirectPort
+	// USE -I (INSERT) to ensure this runs BEFORE Docker's PREROUTING rules
+	err := f.runRule("PREROUTING", "-I", 
+		"-p", "udp", 
+		"--dport", p, 
+		"-j", "REDIRECT", 
+		"--to-port", rp)
 	if err != nil {
-		f.logger.Error("Failed to add SNAT rule: %v", err)
-		// Try to cleanup PREROUTING if SNAT fails
-		f.RemoveRedirect(port, redirectPort, externalIP)
 		return err
 	}
 
-	f.logger.Info("Firewall rules configured: Incoming %d->%d, Outgoing Source %d->%d", port, redirectPort, redirectPort, port)
+	// 2. OUTGOING: SNAT redirectPort -> port
+	// Ensures replies look like they come from the original port (27055)
+	// Also using -I to be safe, though -A often works for POSTROUTING
+	err = f.runRule("POSTROUTING", "-I", 
+		"-p", "udp", 
+		"--sport", rp, 
+		"-j", "SNAT", 
+		"--to-source", snatTarget)
+	
+	if err != nil {
+		f.logger.Error("Failed to add SNAT rule: %v", err)
+		f.RemoveRedirect(port, redirectPort, externalIP) // Cleanup
+		return err
+	}
+
+	f.logger.Info("Firewall rules active: %s -> %s (SNAT as %s)", p, rp, snatTarget)
 	return nil
 }
 
@@ -57,39 +68,41 @@ func (f *firewall) RemoveRedirect(port, redirectPort int, externalIP string) err
 	if os.Geteuid() != 0 {
 		return nil
 	}
+	f.logger.Info("Cleaning up firewall rules...")
 
-	f.logger.Info("Removing firewall rules...")
-
-	// Remove PREROUTING
-	f.removeRule("PREROUTING", "-p", "udp", "--dport", fmt.Sprintf("%d", port), "-j", "REDIRECT", "--to-port", fmt.Sprintf("%d", redirectPort))
-
-	// Remove POSTROUTING
+	p := fmt.Sprintf("%d", port)
+	rp := fmt.Sprintf("%d", redirectPort)
 	snatTarget := fmt.Sprintf("%s:%d", externalIP, port)
-	f.removeRule("POSTROUTING", "-p", "udp", "--sport", fmt.Sprintf("%d", redirectPort), "-j", "SNAT", "--to-source", snatTarget)
+
+	// Remove rules (Order doesn't strictly matter for deletion)
+	f.removeRule("PREROUTING", "-p", "udp", "--dport", p, "-j", "REDIRECT", "--to-port", rp)
+	f.removeRule("POSTROUTING", "-p", "udp", "--sport", rp, "-j", "SNAT", "--to-source", snatTarget)
 
 	return nil
 }
 
-// Helper to check and add rule
-func (f *firewall) runRule(chain string, args ...string) error {
-	// 1. Check if exists
+// runRule executes iptables command. 
+// op is usually "-I" (Insert) or "-A" (Append). 
+// Checks existence first to avoid duplicates.
+func (f *firewall) runRule(chain string, op string, args ...string) error {
+	// 1. Check if rule exists using -C
 	checkArgs := append([]string{"-t", "nat", "-C", chain}, args...)
 	if err := exec.Command("iptables", checkArgs...).Run(); err == nil {
-		return nil // Rule exists
+		f.logger.Info("Rule already exists in %s", chain)
+		return nil 
 	}
 
 	// 2. Add rule
-	addArgs := append([]string{"-t", "nat", "-A", chain}, args...)
+	addArgs := append([]string{"-t", "nat", op, chain}, args...)
 	cmd := exec.Command("iptables", addArgs...)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("iptables error: %v, output: %s", err, string(output))
+		return fmt.Errorf("iptables %s failed: %v, output: %s", op, err, string(output))
 	}
 	return nil
 }
 
-// Helper to remove rule
-func (f *firewall) removeRule(chain string, args ...string) error {
+func (f *firewall) removeRule(chain string, args ...string) {
+	// Use -D to delete
 	delArgs := append([]string{"-t", "nat", "-D", chain}, args...)
-	exec.Command("iptables", delArgs...).Run() // Ignore errors if rule doesn't exist
-	return nil
+	exec.Command("iptables", delArgs...).Run()
 }
