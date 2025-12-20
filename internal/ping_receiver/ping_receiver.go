@@ -2,7 +2,6 @@ package ping_receiver
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"sync"
