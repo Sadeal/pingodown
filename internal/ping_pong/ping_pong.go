@@ -3,7 +3,6 @@ package ping_pong
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"net"
 	"sync"
 	"time"
