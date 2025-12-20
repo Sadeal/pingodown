@@ -3,10 +3,10 @@ package net_utils
 import (
 	"fmt"
 	"net"
-	"strings"
 )
 
 // GetServerExternalIP returns the external IP of the current server
+// Filters out loopback (127.0.0.1), link-local, and multicast addresses
 func GetServerExternalIP() (string, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
@@ -14,6 +14,7 @@ func GetServerExternalIP() (string, error) {
 	}
 
 	for _, iface := range interfaces {
+		// Skip down or loopback interfaces
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
@@ -28,65 +29,17 @@ func GetServerExternalIP() (string, error) {
 			if !ok {
 				continue
 			}
+
 			ip := ipNet.IP
+			// Skip IPv6, link-local, and multicast
 			if ip.To4() == nil || ip.IsLinkLocalUnicast() || ip.IsMulticast() {
 				continue
 			}
+
+			// Found a valid IPv4 address
 			return ip.String(), nil
 		}
 	}
+
 	return "", fmt.Errorf("no valid external IP found on any interface")
-}
-
-// IsLocalIP checks if the given IP string belongs to the local machine (including Docker gateway)
-func IsLocalIP(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-
-	// Check loopback
-	if ip.IsLoopback() {
-		return true
-	}
-
-	// Check all interface addresses
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return false
-	}
-
-	for _, i := range ifaces {
-		addrs, err := i.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			var localIP net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				localIP = v.IP
-			case *net.IPAddr:
-				localIP = v.IP
-			}
-			if localIP.Equal(ip) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// IsDockerPresent checks if the docker0 interface exists
-func IsDockerPresent() bool {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return false
-	}
-	for _, i := range ifaces {
-		if strings.Contains(i.Name, "docker") {
-			return true
-		}
-	}
-	return false
 }

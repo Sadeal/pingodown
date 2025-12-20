@@ -8,7 +8,6 @@ import (
 
 	"github.com/qdm12/golibs/logging"
 	"github.com/qdm12/pingodown/internal/connection"
-	"github.com/qdm12/pingodown/internal/net_utils"
 	"github.com/qdm12/pingodown/internal/ping_receiver"
 	"github.com/qdm12/pingodown/internal/state"
 )
@@ -27,7 +26,7 @@ type proxy struct {
 	pingReceiver  ping_receiver.PingReceiver
 }
 
-func NewProxy(listenAddress, serverAddress string, logger logging.Logger, minPing time.Duration) (Proxy, error) {
+func NewProxy(listenAddress, pingAddress, serverAddress string, logger logging.Logger, minPing time.Duration) (Proxy, error) {
 	s := state.NewState()
 	p := &proxy{
 		bufferSize: 65535,
@@ -36,26 +35,26 @@ func NewProxy(listenAddress, serverAddress string, logger logging.Logger, minPin
 		minPingMS:  minPing.Milliseconds(),
 	}
 
-	// Create main proxy connection (ListenPort)
+	// Create main proxy connection (for clients)
 	var err error
-	proxyAddr, err := net.ResolveUDPAddr("udp", listenAddress)
+	proxyAddress, err := net.ResolveUDPAddr("udp", listenAddress)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve listen address: %w", err)
+		return nil, fmt.Errorf("failed to resolve proxy address: %w", err)
 	}
 
-	p.proxyConn, err = net.ListenUDP("udp", proxyAddr)
+	p.proxyConn, err = net.ListenUDP("udp", proxyAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on proxy address: %w", err)
 	}
 
-	// Resolve target server address (Docker IP or Localhost)
+	// Resolve server address (external IP:PORT)
 	p.serverAddress, err = net.ResolveUDPAddr("udp", serverAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve server address: %w", err)
 	}
 
-	// Create active ping receiver
-	p.pingReceiver, err = ping_receiver.NewPingReceiver(logger)
+	// Create ping receiver
+	p.pingReceiver, err = ping_receiver.NewPingReceiver(pingAddress, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ping receiver: %w", err)
 	}
@@ -69,7 +68,8 @@ type clientPacket struct {
 }
 
 func (p *proxy) Run(ctx context.Context) error {
-	p.logger.Info("Proxy started: Listening on %s -> Forwarding to %s", p.proxyConn.LocalAddr(), p.serverAddress)
+	p.logger.Info("Running proxy to %s on %s", p.serverAddress, p.proxyConn.LocalAddr())
+
 	packets := make(chan clientPacket, 100)
 
 	// Start ping receiver
@@ -89,15 +89,24 @@ func (p *proxy) Run(ctx context.Context) error {
 		for {
 			select {
 			case pingData := <-p.pingReceiver.GetDataChan():
-				// Update state
 				if err := p.state.UpdateClientPing(pingData.ClientIP, pingData.PingMS); err != nil {
 					p.logger.Error("Failed to update client ping: %v", err)
-					continue
 				}
-
-				// Apply delay to existing connection
+				p.logger.Info("Received ping %d ms from %s", pingData.PingMS, pingData.ClientIP)
+				
+				// Try to get connection and apply ping if it exists
 				if conn, err := p.state.GetConnection(&net.UDPAddr{IP: net.ParseIP(pingData.ClientIP)}); err == nil {
-					conn.SetPing(p.minPingMS, pingData.PingMS)
+					additionalPing := p.minPingMS - pingData.PingMS
+					if additionalPing < 0 {
+						additionalPing = 0
+					}
+					
+					if additionalPing > 0 {
+						conn.SetPing(p.minPingMS, pingData.PingMS)
+						p.logger.Info("Saw ping %d, ping is below %d ms, adding %d ms delay", pingData.PingMS, p.minPingMS, additionalPing)
+					} else {
+						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", pingData.PingMS, p.minPingMS)
+					}
 				}
 			case <-ctx.Done():
 				return
@@ -109,32 +118,44 @@ func (p *proxy) Run(ctx context.Context) error {
 	for {
 		select {
 		case packet := <-packets:
-			// 1. FILTER SELF/LOCAL TRAFFIC
-			// Prevents infinite loops and processing packets from Docker gateway/Localhost
-			if net_utils.IsLocalIP(packet.clientAddress.IP.String()) {
-				continue
-			}
-
 			conn, err := p.state.GetConnection(packet.clientAddress)
 			if err != nil {
-				p.logger.Info("New client detected: %s", packet.clientAddress)
+				p.logger.Info("New client %s connecting", packet.clientAddress)
 				
-				// 2. Start Active Pinging for this client
-				p.pingReceiver.AddIP(packet.clientAddress.IP.String())
+				// Get client IP from address
+				clientIP := packet.clientAddress.IP.String()
 
-				// Create connection
+				// Create connection immediately
 				conn, err = connection.NewConnection(p.serverAddress, packet.clientAddress, p.bufferSize)
 				if err != nil {
 					p.logger.Error("Failed to create connection: %v", err)
 					continue
 				}
-				conn = p.state.SetConnection(conn)
 
-				// Start backward forwarding (Server -> Client)
+				// Save connection in state
+				conn = p.state.SetConnection(conn)
+				
+				// Check if we already have ping data for this client
+				if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
+					additionalPing := p.minPingMS - actualPing
+					if additionalPing < 0 {
+						additionalPing = 0
+					}
+					
+					if additionalPing > 0 {
+						conn.SetPing(p.minPingMS, actualPing)
+						p.logger.Info("Saw ping %d, ping is below %d ms, adding %d ms delay", actualPing, p.minPingMS, additionalPing)
+					} else {
+						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", actualPing, p.minPingMS)
+					}
+				} else {
+					p.logger.Info("No ping data yet for client %s, will apply when ping arrives", clientIP)
+				}
+				
+				// Start server-to-client forwarding
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
 			}
 
-			// Forward packet (Client -> Server) with delay logic embedded in connection
 			go func(c connection.Connection, data []byte) {
 				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
 					p.logger.Error("Error writing to server: %v", err)
@@ -142,7 +163,7 @@ func (p *proxy) Run(ctx context.Context) error {
 			}(conn, packet.data)
 
 		case <-ctx.Done():
-			p.logger.Info("Stopping proxy...")
+			p.logger.Info("Context canceled, closing proxy connection")
 			p.pingReceiver.Close()
 			return p.proxyConn.Close()
 		}
@@ -159,7 +180,6 @@ func readFromClients(proxy *net.UDPConn, packets chan<- clientPacket, bufferSize
 
 		data := make([]byte, bytesRead)
 		copy(data, buffer[:bytesRead])
-
 		packets <- clientPacket{
 			clientAddress: clientAddress,
 			data:          data,

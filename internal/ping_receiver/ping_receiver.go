@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
-	"time"
 
 	"github.com/qdm12/golibs/logging"
 )
@@ -18,24 +19,34 @@ type PingData struct {
 type PingReceiver interface {
 	Start(ctx context.Context) error
 	GetDataChan() <-chan PingData
-	AddIP(ip string)
 	Close() error
 }
 
 type pingReceiver struct {
-	dataChan    chan PingData
-	logger      logging.Logger
-	targets     map[string]time.Time // IP -> Last Sent Time
-	targetsLock sync.RWMutex
-	conn        *net.IPConn
-	closed      bool
+	conn      *net.UDPConn
+	dataChan  chan PingData
+	logger    logging.Logger
+	bufSize   int
+	closeOnce sync.Once
+	closed    bool
 }
 
-func NewPingReceiver(logger logging.Logger) (PingReceiver, error) {
+func NewPingReceiver(listenAddress string, logger logging.Logger) (PingReceiver, error) {
+	addr, err := net.ResolveUDPAddr("udp", listenAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve ping address: %w", err)
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to listen on ping address: %w", err)
+	}
+
 	return &pingReceiver{
+		conn:     conn,
 		dataChan: make(chan PingData, 100),
 		logger:   logger,
-		targets:  make(map[string]time.Time),
+		bufSize:  4096,
 	}, nil
 }
 
@@ -43,105 +54,35 @@ func (pr *pingReceiver) GetDataChan() <-chan PingData {
 	return pr.dataChan
 }
 
-// AddIP registers a new IP to be pinged
-func (pr *pingReceiver) AddIP(ip string) {
-	pr.targetsLock.Lock()
-	defer pr.targetsLock.Unlock()
-	
-	// Only add if not already present
-	if _, exists := pr.targets[ip]; !exists {
-		pr.targets[ip] = time.Now()
-		pr.logger.Info("Started monitoring ping for %s", ip)
-	}
-}
-
 func (pr *pingReceiver) Start(ctx context.Context) error {
-	// Listen for ICMP packets (requires root/sudo)
-	conn, err := net.ListenIP("ip4:icmp", &net.IPAddr{IP: net.ParseIP("0.0.0.0")})
-	if err != nil {
-		return fmt.Errorf("failed to listen for ICMP: %w (ensure you are running as root)", err)
-	}
-	pr.conn = conn
-	pr.logger.Info("Pinger started (ICMP Mode)")
+	pr.logger.Info("Ping receiver listening on %s", pr.conn.LocalAddr())
 
-	// Routine to read ICMP replies
 	go func() {
-		buf := make([]byte, 1500)
+		buffer := make([]byte, pr.bufSize)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				pr.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-				n, addr, err := pr.conn.ReadFromIP(buf)
+				bytesRead, remoteAddr, err := pr.conn.ReadFromUDP(buffer)
 				if err != nil {
+					pr.logger.Error("Ping receiver read error: %v", err)
 					continue
 				}
 
-				// Process ICMP Echo Reply (Type 0)
-				// Basic implementation: matches any reply from the IP to the last sent time
-				if n > 0 && buf[0] == 0 {
-					clientIP := addr.IP.String()
-					
-					pr.targetsLock.RLock()
-					sentTime, ok := pr.targets[clientIP]
-					pr.targetsLock.RUnlock()
-
-					if ok {
-						rtt := time.Since(sentTime).Milliseconds()
-						// Send update non-blocking
-						select {
-						case pr.dataChan <- PingData{ClientIP: clientIP, PingMS: rtt}:
-						default:
-						}
-					}
+				data := string(buffer[:bytesRead])
+				pingData, err := ParsePingData(data)
+				if err != nil {
+					pr.logger.Error("Failed to parse ping data from %s: %v", remoteAddr, err)
+					continue
 				}
-			}
-		}
-	}()
 
-	// Routine to send ICMP Echo Requests
-	go func() {
-		ticker := time.NewTicker(1 * time.Second) // Ping every second
-		defer ticker.Stop()
-		seq := 0
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				pr.targetsLock.Lock()
-				for ipStr := range pr.targets {
-					ip := net.ParseIP(ipStr)
-					if ip == nil {
-						continue
-					}
-
-					// Update send time for RTT calculation
-					pr.targets[ipStr] = time.Now()
-
-					// Construct ICMP Echo Request
-					// Type(8), Code(0), Checksum(0), ID, Seq, Payload
-					msg := make([]byte, 8+8) 
-					msg[0] = 8 // Type: Echo Request
-					msg[1] = 0 // Code: 0
-					msg[2] = 0 // Checksum placeholder
-					msg[3] = 0
-					msg[4] = 0 // ID
-					msg[5] = 1
-					msg[6] = byte(seq >> 8)
-					msg[7] = byte(seq)
-
-					// Calculate Checksum
-					check := checkSum(msg)
-					msg[2] = byte(check >> 8)
-					msg[3] = byte(check)
-
-					pr.conn.WriteToIP(msg, &net.IPAddr{IP: ip})
+				select {
+				case pr.dataChan <- pingData:
+					pr.logger.Info("Received ping from %s = %d ms", pingData.ClientIP, pingData.PingMS)
+				case <-ctx.Done():
+					return
 				}
-				pr.targetsLock.Unlock()
-				seq++
 			}
 		}
 	}()
@@ -150,24 +91,40 @@ func (pr *pingReceiver) Start(ctx context.Context) error {
 }
 
 func (pr *pingReceiver) Close() error {
-	pr.closed = true
-	close(pr.dataChan)
-	if pr.conn != nil {
-		return pr.conn.Close()
-	}
-	return nil
+	var err error
+	pr.closeOnce.Do(func() {
+		pr.closed = true
+		close(pr.dataChan)
+		err = pr.conn.Close()
+	})
+	return err
 }
 
-// Calculate standard Internet Checksum
-func checkSum(msg []byte) uint16 {
-	sum := 0
-	for n := 0; n < len(msg)-1; n += 2 {
-		sum += int(msg[n])<<8 + int(msg[n+1])
+func ParsePingData(data string) (PingData, error) {
+	parts := strings.Split(strings.TrimSpace(data), "|")
+	if len(parts) != 2 {
+		return PingData{}, fmt.Errorf("invalid format, expected 'ip|ping', got '%s'", data)
 	}
-	if len(msg)%2 != 0 {
-		sum += int(msg[len(msg)-1]) << 8
+
+	clientIP := parts[0]
+	pingStr := parts[1]
+
+	// Validate IP
+	if net.ParseIP(clientIP) == nil {
+		return PingData{}, fmt.Errorf("invalid IP address '%s'", clientIP)
 	}
-	sum = (sum >> 16) + (sum & 0xffff)
-	sum += (sum >> 16)
-	return uint16(^sum)
+
+	// Parse ping
+	pingMS, err := strconv.ParseInt(pingStr, 10, 64)
+	if err != nil {
+		return PingData{}, fmt.Errorf("invalid ping value '%s': %w", pingStr, err)
+	}
+	if pingMS < 0 {
+		return PingData{}, fmt.Errorf("ping cannot be negative: %d", pingMS)
+	}
+
+	return PingData{
+		ClientIP: clientIP,
+		PingMS:   pingMS,
+	}, nil
 }
