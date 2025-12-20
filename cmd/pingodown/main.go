@@ -11,7 +11,6 @@ import (
 
 	"github.com/qdm12/golibs/logging"
 	"github.com/qdm12/pingodown/internal/firewall"
-	"github.com/qdm12/pingodown/internal/net_utils"
 	"github.com/qdm12/pingodown/internal/proxy"
 )
 
@@ -21,93 +20,70 @@ func main() {
 		panic(err)
 	}
 
-	// Parse command line arguments
-	if len(os.Args) != 3 {
-		logger.Error("Usage: ./pingodown SERVER_PORT PING_MS")
-		logger.Error("Example: ./pingodown 9000 100")
+	// Usage: ./pingodown SERVER_PORT PING_MS [TARGET_IP]
+	if len(os.Args) < 3 {
+		logger.Error("Usage: ./pingodown SERVER_PORT PING_MS [TARGET_IP]")
+		logger.Error("Example: ./pingodown 27055 100 172.17.0.1")
 		os.Exit(1)
 	}
 
-	// Parse SERVER_PORT
 	serverPort, err := strconv.Atoi(os.Args[1])
-	if err != nil {
-		logger.Error("SERVER_PORT must be a number, got: %s", os.Args[1])
-		os.Exit(1)
-	}
-	if serverPort < 1 || serverPort > 65535 {
-		logger.Error("SERVER_PORT must be between 1 and 65535, got: %d", serverPort)
+	if err != nil || serverPort < 1 || serverPort > 65535 {
+		logger.Error("Invalid SERVER_PORT: %s", os.Args[1])
 		os.Exit(1)
 	}
 
-	// Parse PING (in milliseconds)
 	pingMS, err := strconv.Atoi(os.Args[2])
-	if err != nil {
-		logger.Error("PING_MS must be a number, got: %s", os.Args[2])
-		os.Exit(1)
-	}
-	if pingMS < 0 {
-		logger.Error("PING_MS must be >= 0, got: %d", pingMS)
+	if err != nil || pingMS < 0 {
+		logger.Error("Invalid PING_MS: %s", os.Args[2])
 		os.Exit(1)
 	}
 
-	// Calculate ports
-	listenPort := serverPort + 1
-	pingPort := serverPort + 2
-
-	// Validate ports don't conflict
-	if listenPort > 65535 || pingPort > 65535 {
-		logger.Error("Calculated ports exceed 65535. SERVER_PORT=%d is too high", serverPort)
-		os.Exit(1)
+	// Target IP (Docker Container IP or Localhost)
+	// Default to 172.17.0.1 (Docker Gateway) as requested to bypass loop
+	targetIP := "172.17.0.1" 
+	if len(os.Args) > 3 {
+		targetIP = os.Args[3]
 	}
 
-	// Get server external IP
-	serverIP, err := net_utils.GetServerExternalIP()
-	if err != nil {
-		logger.Error("Failed to get server external IP: %v", err)
-		os.Exit(1)
-	}
-
-	// Build addresses
+	// Configuration
+	listenPort := serverPort + 1 // We listen here (e.g., 27056)
 	listenAddress := fmt.Sprintf(":%d", listenPort)
-	pingAddress := fmt.Sprintf(":%d", pingPort)
-	serverAddress := fmt.Sprintf("%s:%d", serverIP, serverPort)
+	serverAddress := fmt.Sprintf("%s:%d", targetIP, serverPort) // Forward to here (e.g., 172.17.0.1:27055)
 	minPing := time.Duration(pingMS) * time.Millisecond
 
 	logger.Info("Starting pingodown")
-	logger.Info("Server port: %d", serverPort)
-	logger.Info("Listen port: %d (clients connect here)", listenPort)
-	logger.Info("Ping port: %d (ping data here)", pingPort)
-	logger.Info("Server address: %s", serverAddress)
-	logger.Info("Minimum ping: %d ms", pingMS)
+	logger.Info("Mode: Native Ping-Pong (No Plugin)")
+	logger.Info("Listening on: %s (Clients connect here)", listenAddress)
+	logger.Info("Forwarding to: %s (Docker/Server)", serverAddress)
+	logger.Info("Minimum Ping: %d ms", pingMS)
 
-	// Setup firewall redirect
+	// Setup Firewall Redirect (27055 -> 27056)
 	fw := firewall.NewFirewall(logger)
 	if err := fw.AddRedirect(serverPort, listenPort); err != nil {
 		logger.Error("Failed to add firewall redirect: %v", err)
-		logger.Info("Note: Firewall redirect requires root/sudo. Continuing without redirect.")
+		logger.Info("Continuing without redirect (ensure traffic reaches port %d)", listenPort)
 	}
 
-	// Setup signal handler for cleanup
+	// Signal Handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	p, err := proxy.NewProxy(listenAddress, pingAddress, serverAddress, logger, minPing)
+	// Start Proxy
+	p, err := proxy.NewProxy(listenAddress, serverAddress, logger, minPing)
 	if err != nil {
 		logger.Error("Failed to create proxy: %v", err)
 		fw.RemoveRedirect(serverPort, listenPort)
 		os.Exit(1)
 	}
 
-	// Run proxy in goroutine
 	errChan := make(chan error, 1)
 	go func() {
 		errChan <- p.Run(ctx)
 	}()
 
-	// Wait for signal or error
 	select {
 	case <-sigChan:
 		logger.Info("Received shutdown signal")
@@ -118,11 +94,8 @@ func main() {
 		}
 	}
 
-	// Cleanup firewall rules
+	// Cleanup
 	logger.Info("Cleaning up firewall rules...")
-	if err := fw.RemoveRedirect(serverPort, listenPort); err != nil {
-		logger.Error("Failed to remove firewall redirect: %v", err)
-	}
-
+	fw.RemoveRedirect(serverPort, listenPort)
 	logger.Info("Shutdown complete")
 }
