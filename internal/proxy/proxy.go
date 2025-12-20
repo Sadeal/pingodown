@@ -8,7 +8,7 @@ import (
 
 	"github.com/qdm12/golibs/logging"
 	"github.com/qdm12/pingodown/internal/connection"
-	"github.com/qdm12/pingodown/internal/ping_pong"
+	"github.com/qdm12/pingodown/internal/ping_receiver"
 	"github.com/qdm12/pingodown/internal/state"
 )
 
@@ -23,31 +23,20 @@ type proxy struct {
 	state         state.State
 	logger        logging.Logger
 	minPingMS     int64
-	pingPong      ping_pong.PingPong
-	localIPs      []string
+	pingReceiver  ping_receiver.PingReceiver
 }
 
-func NewProxy(listenAddress, serverAddress string, logger logging.Logger, minPing time.Duration) (Proxy, error) {
+func NewProxy(listenAddress, pingAddress, serverAddress string, logger logging.Logger, minPing time.Duration) (Proxy, error) {
 	s := state.NewState()
-
-	// Resolve local IPs for loop protection
-	localIPs, err := getLocalIPs()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get local IPs: %w", err)
-	}
-
 	p := &proxy{
 		bufferSize: 65535,
 		state:      s,
 		logger:     logger,
 		minPingMS:  minPing.Milliseconds(),
-		localIPs:   localIPs,
 	}
 
-	// Create ping pong service
-	p.pingPong = ping_pong.NewPingPong(s, logger)
-
 	// Create main proxy connection (for clients)
+	var err error
 	proxyAddress, err := net.ResolveUDPAddr("udp", listenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve proxy address: %w", err)
@@ -58,11 +47,16 @@ func NewProxy(listenAddress, serverAddress string, logger logging.Logger, minPin
 		return nil, fmt.Errorf("failed to listen on proxy address: %w", err)
 	}
 
-	// Resolve server address
-	// CRITICAL: This must be the Docker Container IP or Localhost Mapped port, NOT the public IP.
+	// Resolve server address (external IP:PORT)
 	p.serverAddress, err = net.ResolveUDPAddr("udp", serverAddress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve server address: %w", err)
+	}
+
+	// Create ping receiver
+	p.pingReceiver, err = ping_receiver.NewPingReceiver(pingAddress, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ping receiver: %w", err)
 	}
 
 	return p, nil
@@ -74,18 +68,49 @@ type clientPacket struct {
 }
 
 func (p *proxy) Run(ctx context.Context) error {
-	p.logger.Info("Running proxy -> %s (Listening on %s)", p.serverAddress, p.proxyConn.LocalAddr())
-	p.logger.Info("Ignoring traffic from local IPs: %v", p.localIPs)
+	p.logger.Info("Running proxy to %s on %s", p.serverAddress, p.proxyConn.LocalAddr())
 
 	packets := make(chan clientPacket, 100)
 
-	// Start Ping Pong Service
-	go p.pingPong.Start(ctx, p.proxyConn)
+	// Start ping receiver
+	if err := p.pingReceiver.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start ping receiver: %w", err)
+	}
 
-	// Goroutine to read packets
+	// Goroutine to read game packets from clients
 	go func() {
-		if err := p.readFromClients(p.proxyConn, packets, p.bufferSize); err != nil {
+		if err := readFromClients(p.proxyConn, packets, p.bufferSize); err != nil {
 			p.logger.Error("Error reading from clients: %v", err)
+		}
+	}()
+
+	// Goroutine to handle ping data updates
+	go func() {
+		for {
+			select {
+			case pingData := <-p.pingReceiver.GetDataChan():
+				if err := p.state.UpdateClientPing(pingData.ClientIP, pingData.PingMS); err != nil {
+					p.logger.Error("Failed to update client ping: %v", err)
+				}
+				p.logger.Info("Received ping %d ms from %s", pingData.PingMS, pingData.ClientIP)
+				
+				// Try to get connection and apply ping if it exists
+				if conn, err := p.state.GetConnection(&net.UDPAddr{IP: net.ParseIP(pingData.ClientIP)}); err == nil {
+					additionalPing := p.minPingMS - pingData.PingMS
+					if additionalPing < 0 {
+						additionalPing = 0
+					}
+					
+					if additionalPing > 0 {
+						conn.SetPing(p.minPingMS, pingData.PingMS)
+						p.logger.Info("Saw ping %d, ping is below %d ms, adding %d ms delay", pingData.PingMS, p.minPingMS, additionalPing)
+					} else {
+						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", pingData.PingMS, p.minPingMS)
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -93,42 +118,44 @@ func (p *proxy) Run(ctx context.Context) error {
 	for {
 		select {
 		case packet := <-packets:
-			// 1. SELF-IP CHECK
-			if p.isLocalIP(packet.clientAddress.IP.String()) {
-				// Silently drop packets from ourselves to avoid loops/spam
-				continue
-			}
-
-			// 2. CHECK IF PONG
-			if p.pingPong.IsPong(packet.clientAddress, packet.data) {
-				// It was a pong, state is updated, discard packet
-				// Now check if we need to update delays for existing connection
-				p.updateConnectionDelay(packet.clientAddress)
-				continue
-			}
-
-			// 3. HANDLE GAME TRAFFIC
 			conn, err := p.state.GetConnection(packet.clientAddress)
 			if err != nil {
-				// New Client
 				p.logger.Info("New client %s connecting", packet.clientAddress)
 				
-				// Connect to Server
+				// Get client IP from address
+				clientIP := packet.clientAddress.IP.String()
+
+				// Create connection immediately
 				conn, err = connection.NewConnection(p.serverAddress, packet.clientAddress, p.bufferSize)
 				if err != nil {
 					p.logger.Error("Failed to create connection: %v", err)
 					continue
 				}
-				conn = p.state.SetConnection(conn)
 
-				// Start forwarding Server -> Client
+				// Save connection in state
+				conn = p.state.SetConnection(conn)
+				
+				// Check if we already have ping data for this client
+				if actualPing, err := p.state.GetClientPing(clientIP); err == nil {
+					additionalPing := p.minPingMS - actualPing
+					if additionalPing < 0 {
+						additionalPing = 0
+					}
+					
+					if additionalPing > 0 {
+						conn.SetPing(p.minPingMS, actualPing)
+						p.logger.Info("Saw ping %d, ping is below %d ms, adding %d ms delay", actualPing, p.minPingMS, additionalPing)
+					} else {
+						p.logger.Info("Saw ping %d, ping is not below %d ms, no delay added", actualPing, p.minPingMS)
+					}
+				} else {
+					p.logger.Info("No ping data yet for client %s, will apply when ping arrives", clientIP)
+				}
+				
+				// Start server-to-client forwarding
 				go conn.ForwardServerToClient(ctx, p.proxyConn, p.logger)
 			}
 
-			// Apply delay logic if ping is known
-			p.updateConnectionDelay(packet.clientAddress)
-
-			// Forward Client -> Server
 			go func(c connection.Connection, data []byte) {
 				if err := c.WriteToServerWithDelay(ctx, data); err != nil {
 					p.logger.Error("Error writing to server: %v", err)
@@ -136,31 +163,14 @@ func (p *proxy) Run(ctx context.Context) error {
 			}(conn, packet.data)
 
 		case <-ctx.Done():
-			p.logger.Info("Context canceled, closing proxy")
+			p.logger.Info("Context canceled, closing proxy connection")
+			p.pingReceiver.Close()
 			return p.proxyConn.Close()
 		}
 	}
 }
 
-func (p *proxy) updateConnectionDelay(clientAddr *net.UDPAddr) {
-	clientIP := clientAddr.IP.String()
-	actualPing, err := p.state.GetClientPing(clientIP)
-	if err != nil {
-		// No ping data yet, no delay
-		return
-	}
-
-	conn, err := p.state.GetConnection(clientAddr)
-	if err != nil {
-		return
-	}
-
-	// Calculate and set delay
-	// "If ping received... add delay" logic
-	conn.SetPing(p.minPingMS, actualPing)
-}
-
-func (p *proxy) readFromClients(proxy *net.UDPConn, packets chan<- clientPacket, bufferSize int) error {
+func readFromClients(proxy *net.UDPConn, packets chan<- clientPacket, bufferSize int) error {
 	buffer := make([]byte, bufferSize)
 	for {
 		bytesRead, clientAddress, err := proxy.ReadFromUDP(buffer)
@@ -170,48 +180,9 @@ func (p *proxy) readFromClients(proxy *net.UDPConn, packets chan<- clientPacket,
 
 		data := make([]byte, bytesRead)
 		copy(data, buffer[:bytesRead])
-
 		packets <- clientPacket{
 			clientAddress: clientAddress,
 			data:          data,
 		}
 	}
-}
-
-// Helpers
-
-func (p *proxy) isLocalIP(ip string) bool {
-	for _, local := range p.localIPs {
-		if local == ip {
-			return true
-		}
-	}
-	return false
-}
-
-func getLocalIPs() ([]string, error) {
-	var ips []string
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-	for _, i := range ifaces {
-		addrs, err := i.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip != nil {
-				ips = append(ips, ip.String())
-			}
-		}
-	}
-	return ips, nil
 }
